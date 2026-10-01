@@ -1,12 +1,25 @@
 //! Compact SQLite storage: insert, window queries, pruning and thinning.
 
-use crate::model::{ProcRow, Sample};
+use crate::model::{ProcRow, Sample, Sensors};
 use rusqlite::{params, Connection, OptionalExtension};
 use std::path::{Path, PathBuf};
 
 /// Samples older than this are thinned to one per `THIN_STEP_SECS`.
 pub const FULL_RES_SECS: i64 = 24 * 3600;
 pub const THIN_STEP_SECS: i64 = 10;
+
+/// Nullable columns added in schema v1. NULL means the sensor was unavailable.
+/// Scaled integers keep rows small: temps, gpu and frequency x10, queue x100.
+const SENSOR_COLUMNS: [&str; 10] =
+    ["ac", "batt", "saver", "temp", "fpct", "gpu", "gtemp", "gthr", "dq", "dlat"];
+
+fn scaled(v: Option<f32>, k: f32) -> Option<i64> {
+    v.map(|x| (x * k).round() as i64)
+}
+
+fn unscaled(v: Option<i64>, k: f32) -> Option<f32> {
+    v.map(|x| x as f32 / k)
+}
 
 pub struct Store {
     conn: Connection,
@@ -51,6 +64,8 @@ impl Store {
 
     fn init(conn: Connection) -> rusqlite::Result<Store> {
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
+        // Must come before the first write: it only takes effect on a brand-new database.
+        conn.execute_batch("PRAGMA auto_vacuum=INCREMENTAL")?;
         // journal_mode returns a row, so query it rather than execute it.
         let _: String = conn.query_row("PRAGMA journal_mode=WAL", [], |r| r.get(0))?;
         conn.execute_batch(
@@ -74,14 +89,48 @@ impl Store {
                  PRIMARY KEY (ts, name)
              ) WITHOUT ROWID;",
         )?;
+        Self::migrate(&conn)?;
         Ok(Store { conn })
     }
 
+    /// Adds sensor columns to databases created by older versions.
+    fn migrate(conn: &Connection) -> rusqlite::Result<()> {
+        let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+        if version < 1 {
+            let have: Vec<String> = conn
+                .prepare("SELECT name FROM pragma_table_info('samples')")?
+                .query_map([], |r| r.get(0))?
+                .collect::<Result<_, _>>()?;
+            for col in SENSOR_COLUMNS {
+                if !have.iter().any(|h| h == col) {
+                    conn.execute_batch(&format!("ALTER TABLE samples ADD COLUMN {col} INTEGER"))?;
+                }
+            }
+            conn.execute_batch("PRAGMA user_version = 1")?;
+        }
+        Ok(())
+    }
+
     pub fn insert(&mut self, s: &Sample) -> rusqlite::Result<()> {
-        const MIB: u64 = 1024 * 1024;
+        self.insert_many(std::slice::from_ref(s))
+    }
+
+    /// Inserts several samples in one transaction.
+    pub fn insert_many(&mut self, samples: &[Sample]) -> rusqlite::Result<()> {
         let tx = self.conn.transaction()?;
+        for s in samples {
+            Self::insert_in(&tx, s)?;
+        }
+        tx.commit()
+    }
+
+    fn insert_in(tx: &rusqlite::Transaction, s: &Sample) -> rusqlite::Result<()> {
+        const MIB: u64 = 1024 * 1024;
+        let x = &s.sensors;
         tx.execute(
-            "INSERT OR REPLACE INTO samples VALUES (?1,?2,?3,?4,?5,?6,?7)",
+            "INSERT OR REPLACE INTO samples
+             (ts,cpu,mem_used,mem_total,swap_used,mhz,disk,ac,batt,saver,temp,fpct,gpu,gtemp,gthr,dq,dlat)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)",
             params![
                 s.ts,
                 (s.cpu_pct * 10.0).round() as i64,
@@ -89,7 +138,17 @@ impl Store {
                 (s.mem_total / MIB) as i64,
                 (s.swap_used / MIB) as i64,
                 s.clock_mhz as i64,
-                (s.disk_bps / 1024) as i64
+                (s.disk_bps / 1024) as i64,
+                x.on_ac.map(i64::from),
+                x.battery_pct.map(i64::from),
+                x.battery_saver.map(i64::from),
+                scaled(x.temp_c, 10.0),
+                scaled(x.freq_pct, 10.0),
+                scaled(x.gpu_pct, 10.0),
+                scaled(x.gpu_temp_c, 10.0),
+                x.gpu_throttle.map(i64::from),
+                scaled(x.disk_queue, 100.0),
+                scaled(x.disk_latency_ms, 10.0),
             ],
         )?;
         {
@@ -107,14 +166,15 @@ impl Store {
                 ])?;
             }
         }
-        tx.commit()
+        Ok(())
     }
 
     /// All samples with `from <= ts <= to`, oldest first, with their programs.
     pub fn window(&self, from: i64, to: i64) -> rusqlite::Result<Vec<Sample>> {
         const MIB: u64 = 1024 * 1024;
         let mut st = self.conn.prepare_cached(
-            "SELECT ts,cpu,mem_used,mem_total,swap_used,mhz,disk FROM samples
+            "SELECT ts,cpu,mem_used,mem_total,swap_used,mhz,disk,
+                    ac,batt,saver,temp,fpct,gpu,gtemp,gthr,dq,dlat FROM samples
              WHERE ts BETWEEN ?1 AND ?2 ORDER BY ts",
         )?;
         let mut out: Vec<Sample> = st
@@ -127,6 +187,18 @@ impl Store {
                     swap_used: r.get::<_, i64>(4)? as u64 * MIB,
                     clock_mhz: r.get::<_, i64>(5)? as u32,
                     disk_bps: r.get::<_, i64>(6)? as u64 * 1024,
+                    sensors: Sensors {
+                        on_ac: r.get::<_, Option<i64>>(7)?.map(|v| v != 0),
+                        battery_pct: r.get::<_, Option<i64>>(8)?.map(|v| v as u8),
+                        battery_saver: r.get::<_, Option<i64>>(9)?.map(|v| v != 0),
+                        temp_c: unscaled(r.get(10)?, 10.0),
+                        freq_pct: unscaled(r.get(11)?, 10.0),
+                        gpu_pct: unscaled(r.get(12)?, 10.0),
+                        gpu_temp_c: unscaled(r.get(13)?, 10.0),
+                        gpu_throttle: r.get::<_, Option<i64>>(14)?.map(|v| v as u8),
+                        disk_queue: unscaled(r.get(15)?, 100.0),
+                        disk_latency_ms: unscaled(r.get(16)?, 10.0),
+                    },
                     procs: Vec::new(),
                 })
             })?
@@ -197,13 +269,19 @@ impl Store {
             params![thin_before, THIN_STEP_SECS],
         )?;
         tx.commit()?;
+        if removed > 0 {
+            // Hand deleted pages back to the OS so the file really shrinks.
+            // Each step frees a page, so the rows have to be consumed.
+            let mut st = self.conn.prepare("PRAGMA incremental_vacuum")?;
+            let mut rows = st.query([])?;
+            while rows.next()?.is_some() {}
+        }
         Ok(removed)
     }
 
-    /// Reclaims free pages and checkpoints the WAL. Call when idle.
+    /// Checkpoints the WAL into the main file. Call when idle or shutting down.
     pub fn compact(&self) -> rusqlite::Result<()> {
-        self.conn
-            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE); PRAGMA incremental_vacuum;")
+        self.conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
     }
 }
 
@@ -220,6 +298,18 @@ mod tests {
             swap_used: 512 << 20,
             clock_mhz: 3200,
             disk_bps: 5 << 20,
+            sensors: Sensors {
+                on_ac: Some(false),
+                battery_pct: Some(61),
+                battery_saver: Some(true),
+                temp_c: Some(71.5),
+                freq_pct: Some(63.0),
+                gpu_pct: Some(88.5),
+                gpu_temp_c: Some(79.0),
+                gpu_throttle: Some(3),
+                disk_queue: Some(1.25),
+                disk_latency_ms: Some(12.5),
+            },
             procs: vec![ProcRow {
                 name: "chrome.exe".into(),
                 count: 30,
@@ -274,4 +364,92 @@ mod tests {
         let old = s.window(now - 2 * 86400, now - 2 * 86400 + 100).unwrap();
         assert!(old.iter().all(|x| x.procs.len() == 1));
     }
+
+    #[test]
+    fn missing_sensors_stay_none() {
+        let mut s = Store::open_in_memory().unwrap();
+        let mut smp = sample(5);
+        smp.sensors = Sensors::default();
+        s.insert(&smp).unwrap();
+        let got = s.window(5, 5).unwrap().remove(0);
+        assert_eq!(got.sensors, Sensors::default());
+    }
+
+    #[test]
+    fn upgrades_a_v0_database_without_losing_data() {
+        let dir = std::env::temp_dir().join(format!("bb-migrate-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&dir);
+        {
+            // The schema shipped before sensors existed.
+            let c = Connection::open(&dir).unwrap();
+            c.execute_batch(
+                "CREATE TABLE samples (ts INTEGER PRIMARY KEY, cpu INTEGER NOT NULL, mem_used INTEGER NOT NULL,
+                    mem_total INTEGER NOT NULL, swap_used INTEGER NOT NULL, mhz INTEGER NOT NULL, disk INTEGER NOT NULL);
+                 INSERT INTO samples VALUES (100, 555, 4096, 16384, 0, 3000, 2048);",
+            )
+            .unwrap();
+        }
+        let mut s = Store::open(&dir).unwrap();
+        let old = s.window(100, 100).unwrap().remove(0);
+        assert_eq!(old.cpu_pct, 55.5);
+        assert_eq!(old.sensors, Sensors::default());
+        s.insert(&sample(101)).unwrap();
+        assert_eq!(s.window(101, 101).unwrap()[0], sample(101));
+        drop(s);
+        // Opening again must not try to re-add columns.
+        assert_eq!(Store::open(&dir).unwrap().stats().unwrap().samples, 2);
+        for ext in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{}", dir.display(), ext));
+        }
+    }
+
+    /// Measures the on-disk footprint with a full day of worst-case synthetic data.
+    /// Run: cargo test --release -p bb-core size_of -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn size_of_a_day_of_data() {
+        let path = std::env::temp_dir().join(format!("bb-size-{}.db", std::process::id()));
+        let size = |p: &Path| -> u64 {
+            ["", "-wal", "-shm"].iter().filter_map(|e| std::fs::metadata(format!("{}{e}", p.display())).ok()).map(|m| m.len()).sum()
+        };
+        let mut st = Store::open(&path).unwrap();
+        let now = 100 * 86400;
+        let day: Vec<Sample> = (0..86400)
+            .map(|i| {
+                let mut s = sample(now - 86400 + i);
+                // 24 distinct program rows with moving numbers: the worst case.
+                s.procs = (0..24)
+                    .map(|p| ProcRow {
+                        name: format!("program{p}.exe"),
+                        count: 1 + (i % 7) as u32,
+                        cpu_pct: ((i + p) % 90) as f32 / 3.0,
+                        disk_bps: ((i * 7 + p) % 5000) as u64 * 1024,
+                        mem_bytes: (100 + (i + p) % 900) as u64 * 1024 * 1024,
+                    })
+                    .collect();
+                s.sensors.temp_c = Some(50.0 + (i % 400) as f32 / 10.0);
+                s.sensors.gpu_pct = Some((i % 100) as f32);
+                s
+            })
+            .collect();
+        for chunk in day.chunks(5000) {
+            st.insert_many(chunk).unwrap();
+        }
+        st.compact().unwrap();
+        let full = size(&path) as f64 / 1e6;
+        println!("one day at 1 s resolution: {full:.1} MB");
+        // Age that day by 24 h so it gets thinned.
+        st.maintain(now + 86400 + 60, 7).unwrap();
+        st.compact().unwrap();
+        let thinned = size(&path) as f64 / 1e6;
+        println!("same day after thinning to 1 per {THIN_STEP_SECS} s: {thinned:.1} MB");
+        assert!(thinned < 0.3 * full, "file did not shrink after thinning");
+        drop(st);
+        for ext in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{ext}", path.display()));
+        }
+    }
 }
+
+
+

@@ -1,14 +1,27 @@
 //! Reads CPU, memory, disk and per-program usage from the OS.
 
 use crate::model::{ProcRow, Sample};
+use crate::sensors::SensorReader;
 use std::collections::HashMap;
 use std::time::Instant;
 use sysinfo::{ProcessesToUpdate, System};
+
+/// Runs this process slightly above normal priority, so a recorder keeps sampling
+/// while the CPU is pegged. That is exactly when its data matters most. It is light
+/// (about 2% of a core), so this costs other programs nothing noticeable.
+pub fn raise_priority() {
+    #[cfg(windows)]
+    unsafe {
+        use windows_sys::Win32::System::Threading::{GetCurrentProcess, SetPriorityClass, ABOVE_NORMAL_PRIORITY_CLASS};
+        SetPriorityClass(GetCurrentProcess(), ABOVE_NORMAL_PRIORITY_CLASS);
+    }
+}
 
 pub struct Sampler {
     sys: System,
     top_n: usize,
     last: Instant,
+    sensors: SensorReader,
 }
 
 impl Sampler {
@@ -19,7 +32,7 @@ impl Sampler {
         sys.refresh_cpu_all();
         sys.refresh_memory();
         sys.refresh_processes(ProcessesToUpdate::All, true);
-        Sampler { sys, top_n: top_n.max(1), last: Instant::now() }
+        Sampler { sys, top_n: top_n.max(1), last: Instant::now(), sensors: SensorReader::new() }
     }
 
     /// Takes one sample stamped with unix time `ts`.
@@ -57,8 +70,14 @@ impl Sampler {
             swap_used: self.sys.used_swap(),
             clock_mhz,
             disk_bps: disk_total,
+            sensors: self.sensors.read(),
             procs: top_programs(procs, self.top_n),
         }
+    }
+
+    /// Name of the NVIDIA GPU being monitored, if any.
+    pub fn gpu_name(&self) -> Option<String> {
+        self.sensors.gpu_name()
     }
 
     /// Takes a sample after `wait` and returns it, for one-off views like `bb top`.
@@ -162,3 +181,5 @@ mod tests {
         assert!(!smp.procs.is_empty());
     }
 }
+
+

@@ -1,4 +1,4 @@
-﻿# blackbox (`bb`)
+# blackbox (`bb`)
 
 A flight recorder for your computer's performance.
 
@@ -10,7 +10,7 @@ bb why 15:40
 
 and it answers in plain English with evidence.
 
-> **Status: v0.1.** Records CPU, memory, pagefile, disk throughput, clock speed and the busiest programs, and explains five kinds of slowdown. See [Limits](#limits-read-this) before trusting it blindly.
+> **Status: v0.2.** Records CPU, memory, pagefile, disk throughput and latency, clock speed, temperature, battery/power state, GPU load and the busiest programs, and explains a dozen kinds of slowdown, including short spikes and freezes. See [Limits](#limits-read-this) before trusting it blindly.
 
 ---
 
@@ -134,6 +134,26 @@ Choosing a span: use a short span (`--span 60s`) to pin down a brief freeze, a l
 
 Shows the database path and size, how many samples exist, the time range covered, and the best clock speed seen. It warns you if the recorder doesn't look like it's running.
 
+### `bb sensors`
+
+Shows which extra sensors work on this machine (battery and power, temperature, CPU speed, GPU load and temperature, GPU throttling, disk latency and queue) with their current readings. A sensor your hardware or drivers don't expose shows "not available", and `bb why` skips the rules that need it.
+
+```
+$ bb sensors
+  Battery / power  100%, plugged in
+  Temperature      63 C (hottest system sensor)
+  CPU speed        74% of rated maximum
+  GPU load         1%
+  GPU temperature  45 C
+  GPU throttling   none
+  Disk latency     0.2 ms per request
+  Disk queue       0.01 requests waiting
+```
+
+### `bb start` / `bb stop`
+
+`bb start` records in the background with no terminal (it accepts the same options as `bb run`). `bb stop` stops it. Only one recorder runs per database.
+
 ### `bb bench`
 
 Measures blackbox's own cost on **your** machine: time per sample, share of a core, memory used. It writes to a throwaway database that is deleted afterward.
@@ -153,8 +173,16 @@ Each finding has a title, evidence, a confidence label (high / medium / low) and
 | **A program hogging the CPU** | One program averaged **25%+** of total CPU | Up to two are reported. Programs with many processes are summed. |
 | **CPU saturated by many programs** | Whole-machine CPU **85%+** and no single hog | Lists the top three contributors. |
 | **Memory pressure / paging** | Memory **90%+** full, or **80%+** with **1 GB+** of pagefile in use | Names the largest memory user. |
-| **Probable CPU throttling** | CPU **60%+** busy while the clock averages **75% or less** of the best clock ever recorded | Inferred from clock speed only. See [Limits](#limits-read-this). |
+| **CPU throttling** | CPU **60%+** busy while it runs at **75% or less** of its rated maximum speed | On Windows the speed is measured (the OS "% of Maximum Frequency" counter). Otherwise it is inferred from the best clock ever recorded. The cause is named when known: **heat** (85 C+), **Battery Saver**, or **battery power limits**, each with advice. |
+| **Battery Saver / low battery** | Battery Saver on for half the window while the CPU was 30%+ busy, or a battery at 15% or less | Low confidence. Windows slows things down in both cases. |
+| **Running very hot** | The hottest system sensor averaged **90 C+** and heat isn't already blamed for throttling | Low confidence. The sensor is a system thermal zone, which may not be the CPU core itself. |
+| **GPU throttled** | GPU 50%+ busy and the driver reports a **heat**, **power cap** or hardware slowdown for half the window | NVIDIA only (needs the driver's NVML). Says whether it was heat or the power budget, and notes if you were on battery. |
+| **GPU maxed out / very hot** | GPU load **90%+**, or GPU temperature **85 C+** | GPU load works on any GPU vendor on Windows. |
 | **Heavy disk activity** | Total disk throughput **80 MB/s+** | Names the program doing most of the I/O. |
+| **Slow disk** | Disk requests averaged **50 ms+** (counting only seconds with disk use), or **4+** requests waiting | Catches a slow or failing disk that moves little data. Names the busiest program. |
+| **Short CPU spike** | CPU averaged **95%+** for **5 consecutive seconds** while the whole window looked fine | Names the busiest program then, and the exact time to zoom in on. |
+| **Brief disk stall** | A single disk request time of **300 ms+** that the average hides | Gives the time and the program doing the most I/O. |
+| **Machine stalled** | A **5 to 60 second hole** in the recording | The recorder samples every second, so a hole means everything was stuck. A laptop that briefly slept looks the same. |
 
 ### Programs with specific advice
 
@@ -183,6 +211,19 @@ Most likely causes:
 
 (That run was a deliberate test: a few busy loops started on a Linux machine to check that the recorder blames the right thing.)
 
+A short burst that the whole window hides, found on Windows (also a deliberate test, 10 seconds of every core busy inside a quiet 2 minutes):
+
+```
+$ bb why now --span 2m
+Most likely causes:
+
+ 1. [medium] A short CPU spike around 22:27:24
+      - 22:27:22 to 22:27:26: CPU averaged 100%
+      - the whole window averaged only 30%, so the burst is easy to miss
+      - busiest then: powershell.exe (30 processes) at 80%
+      > Run `bb why 22:27:24 --span 30s` to zoom in.
+```
+
 ---
 
 ## Run it automatically at login (Windows)
@@ -207,25 +248,27 @@ Start at login uses the current user's `Run` registry entry, so it works on batt
 
 ## How much it costs
 
-Measured by `bb bench` on a small Linux test machine (your numbers will differ, so run `bb bench` yourself):
+Measured by `bb bench` (your numbers will differ, so run `bb bench` yourself):
 
-| Cost | Measured |
-|---|---|
-| Work per sample | about 2.7 ms average, 5 ms worst |
-| CPU | about 0.3% of one core at 1 sample/second |
-| Memory | about 5 MB resident |
+| Cost | Linux (small test machine) | Windows 11 laptop |
+|---|---|---|
+| Work per sample | about 2.7 ms average, 5 ms worst | about 20 ms average, 38 ms worst |
+| CPU at 1 sample/second | about 0.3% of one core | about 2% of one core |
+| Memory | about 5 MB resident | about 38 MB resident |
+
+The Windows recorder runs at slightly above normal priority, so it keeps sampling while the CPU is pegged. That is exactly when the data matters most. It uses about 2% of one core, so other programs don't notice.
 
 **Disk usage**, measured with a full day of synthetic data at the worst case of 24 program rows per sample:
 
 | Data | Size |
 |---|---|
-| One day at full 1-second resolution | about 44 MB |
-| One day after thinning to 1 sample per 10 s | about 4 MB |
-| 7 days retained (1 full day + 6 thinned) | about 68 MB |
+| One day at full 1-second resolution | about 82 MB |
+| One day after thinning to 1 sample per 10 s | about 10 MB |
+| 7 days retained (1 full day + 6 thinned) | about 140 MB |
 
 Data older than 24 hours is automatically thinned to one sample every 10 seconds, so older history is coarser but still answers "what happened Tuesday afternoon?". Real usage is typically lower than the worst case.
 
-**Not yet measured:** the cost of process enumeration on Windows. That is the part most likely to differ from the numbers above, which is why `bb bench` exists.
+Thinning returns the space to the OS, so the file shrinks after the first day rather than staying at its peak.
 
 ---
 
@@ -246,14 +289,16 @@ Data older than 24 hours is automatically thinned to one sample every 10 seconds
 
 blackbox v0.1 is honest about what it can't see. Don't over-trust it.
 
-- **No temperatures, GPU or battery data yet.** If your slowdown was a hot GPU or a battery power limit, `bb why` may say "no clear cause".
-- **Throttling is inferred, not measured.** It's flagged when the CPU is busy but running far below the fastest clock blackbox has ever seen. It cannot tell heat from power limits from battery saver. The baseline is the best clock *in your own recording*, so a brand-new database has a weak baseline.
-- **"Heavy disk" means high throughput, not a queue.** A slow disk doing little work won't be flagged yet.
+- **Sensors vary by machine.** Run `bb sensors` to see what yours exposes. Anything unavailable is skipped, and a slowdown that needs it may come back as "no clear cause".
+- **Temperature is one system sensor,** a thermal zone that Windows exposes without admin rights. On some machines that is not the CPU core, so real CPU heat can be missed. Reading the core temperature needs a kernel driver, which blackbox does not install.
+- **GPU heat and throttle reasons are NVIDIA only** (via the driver's NVML). GPU load works on any vendor on Windows, but AMD and Intel GPUs get no temperature or throttle data yet. Only the first NVIDIA GPU is read.
+- **Battery, temperature, GPU and disk latency are Windows-first.** On Linux, battery and a thermal-zone temperature are read, but CPU speed percent, GPU load and disk latency are not. Those rules just don't fire. The Linux sensor code is covered by tests but has not been run on real Linux hardware.
+- **Throttling is measured on Windows** (the OS "% of Maximum Frequency" counter). Elsewhere it is inferred from clock speed against the best clock in your own recording, so a brand-new database has a weak baseline. The *cause* (heat, Battery Saver, battery limits) is a best guess from the other sensors.
 - **Only top programs are stored** (top 5 per category per second). A slowdown caused by hundreds of tiny processes may not name a culprit.
-- **Averages hide short spikes.** A 2-second freeze inside a 4-minute window can be diluted. Use a shorter `--span`.
+- **Spikes need to last.** CPU bursts shorter than 5 seconds, and disk stalls that don't show up as a long request time, can still be averaged away. Use a shorter `--span`. Samples older than 24 hours are 10 seconds apart, so spike and stall detection only works on recent data.
 - **Thresholds are educated guesses**, not tuned on lots of real machines. Expect some wrong or missing explanations at first.
 - **Without administrator rights**, Windows may hide details for some protected system processes. They can show lower numbers than reality.
-- **Verified so far:** the rule engine and storage are covered by automated tests, and detection of an induced CPU hog was checked end to end on Linux. A full Windows run is still your job.
+- **Verified so far:** the rule engine, storage, migration and sensor parsing are covered by automated tests (60+). Detection of an induced CPU hog and an induced short CPU burst was checked end to end on Windows, and of a CPU hog on Linux. **Not verified end to end:** heat, GPU throttle and battery causes (the sensors are read correctly, but no real slowdown of those kinds has been induced), and a genuinely slow disk (a fast NVMe never got slow enough to trigger the rule).
 
 ---
 
@@ -263,7 +308,7 @@ blackbox v0.1 is honest about what it can't see. Don't over-trust it.
 The recorder wasn't running at that time. Check with `bb status`; it shows the time range actually covered.
 
 **`bb why` says "No clear cause."**
-CPU, memory, disk and clock all looked normal in that window. Try a shorter or different `--span`, or the slowdown was something v0.1 can't see (GPU, heat, network).
+CPU, memory, disk, GPU, heat and power all looked normal in that window. Try a shorter or different `--span`, or the slowdown was something blackbox can't see yet (network, or a sensor that `bb sensors` shows as unavailable).
 
 **`bb status` says the recorder doesn't seem to be running.**
 The last sample is more than 30 seconds old. Start it with `bb start`.
@@ -286,12 +331,14 @@ blackbox/
   Cargo.toml            workspace
   bb-core/              the engine (library)
     src/sampler.rs      reads CPU, memory, disk and per-program usage
+    src/sensors.rs      battery, temperature, GPU and disk-latency readings
     src/store.rs        compact SQLite storage, pruning, thinning
     src/rules.rs        the "why" engine: data in, ranked causes out
     src/timeparse.rs    parses "15:40", "10m ago", ...
     src/model.rs        shared data types
   bb-cli/               the `bb` command-line program
-    src/main.rs
+    src/main.rs         commands
+    src/install.rs      start/stop, install/uninstall
 ```
 
 Run the tests:
@@ -300,7 +347,7 @@ Run the tests:
 cargo test
 ```
 
-The rule engine is tested by feeding it synthetic slowdowns (a CPU hog, Defender scanning, memory exhaustion, a clock drop, saturated disk, a healthy machine) and checking it names the right cause, and nothing on a healthy one.
+The rule engine is tested by feeding it synthetic slowdowns (a CPU hog, Defender scanning, memory exhaustion, throttling from heat or battery, a maxed-out or throttled GPU, a slow disk, short spikes and stalls, a healthy machine) and checking it names the right cause, and nothing on a healthy one.
 
 Measure the storage footprint yourself:
 
@@ -316,9 +363,9 @@ cargo test --release -p bb-core size_of -- --ignored --nocapture
 
 | Version | Planned |
 |---|---|
-| **v0.1** (now) | Recorder, compact storage, `why`/`top`/`status`/`bench`, five causes, automated tests |
-| **v0.2** | More rules, plus a test suite that *causes* real slowdowns (CPU stress, memory stress, big disk copy) and checks blackbox names them. Aim: report "detected N of M induced slowdowns" |
-| **v0.3** | GPU and temperature via a sensor library, battery/power state, an HTML report |
+| **v0.1** | Recorder, compact storage, `why`/`top`/`status`/`bench`, five causes, automated tests |
+| **v0.2** (now) | Battery and power, temperature, GPU, disk latency, short-spike and stall detection, one-command `install`, background `start`/`stop`, `bb sensors` |
+| **v0.3** | A test suite that *causes* real slowdowns (CPU stress, memory stress, big disk copy, heat) and checks blackbox names them. Aim: report "detected N of M induced slowdowns". AMD/Intel GPU temperature, prebuilt releases, an HTML report |
 | **Later** | Snapshot installed apps, startup items, drivers and services over time so `why` can say "this got slow right after the 14 Sept driver update" |
 
 ---

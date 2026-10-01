@@ -14,8 +14,36 @@ pub struct ProcRow {
     pub mem_bytes: u64,
 }
 
+/// Extra sensor readings. Every field is optional because hardware and drivers
+/// differ; `None` means "not available here", never "zero".
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Sensors {
+    /// True when plugged in.
+    pub on_ac: Option<bool>,
+    pub battery_pct: Option<u8>,
+    /// Windows Battery Saver is on.
+    pub battery_saver: Option<bool>,
+    /// Hottest system temperature sensor, in degrees C.
+    pub temp_c: Option<f32>,
+    /// Current CPU speed as a percent of its rated maximum (Windows only).
+    pub freq_pct: Option<f32>,
+    /// Busiest GPU engine, 0..100.
+    pub gpu_pct: Option<f32>,
+    pub gpu_temp_c: Option<f32>,
+    /// Why the GPU is slowing down, as `GPU_THERMAL | GPU_POWER | GPU_HW` bits.
+    pub gpu_throttle: Option<u8>,
+    /// Average number of disk requests waiting.
+    pub disk_queue: Option<f32>,
+    /// Average time for a disk request to complete, in milliseconds.
+    pub disk_latency_ms: Option<f32>,
+}
+
+pub const GPU_THERMAL: u8 = 1;
+pub const GPU_POWER: u8 = 2;
+pub const GPU_HW: u8 = 4;
+
 /// One recorded moment.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct Sample {
     /// Unix time in seconds.
     pub ts: i64,
@@ -28,6 +56,7 @@ pub struct Sample {
     pub clock_mhz: u32,
     /// Total disk throughput in bytes per second.
     pub disk_bps: u64,
+    pub sensors: Sensors,
     pub procs: Vec<ProcRow>,
 }
 
@@ -58,3 +87,4 @@ pub struct Finding {
     /// Used for ranking, higher first.
     pub score: f32,
 }
+

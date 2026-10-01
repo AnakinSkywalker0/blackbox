@@ -1,7 +1,8 @@
 //! The "why" engine: a recorded window in, ranked causes out.
 //! Each rule is a pure function of the window.
 
-use crate::model::{Confidence, Finding, Sample};
+use crate::model::{Confidence, Finding, Sample, GPU_HW, GPU_POWER, GPU_THERMAL};
+use chrono::{Local, TimeZone};
 use std::collections::HashMap;
 
 const GB: f64 = 1024.0 * 1024.0 * 1024.0;
@@ -18,9 +19,27 @@ pub struct Thresholds {
     pub swap_high_bytes: u64,
     /// CPU must be at least this busy for throttling to be suspected.
     pub throttle_busy_pct: f32,
-    /// Clock at or below this fraction of the best seen means throttling.
+    /// Speed at or below this fraction of the maximum means throttling.
     pub throttle_clock_ratio: f32,
     pub disk_heavy_bps: u64,
+    /// Temperature at which throttling is blamed on heat.
+    pub hot_temp_c: f32,
+    /// Temperature worth reporting even without a visible slowdown.
+    pub very_hot_temp_c: f32,
+    /// Share of samples a condition must hold in to count (battery saver, on battery, GPU throttle).
+    pub state_fraction: f32,
+    pub battery_low_pct: u8,
+    pub gpu_busy_pct: f32,
+    pub gpu_hot_c: f32,
+    /// Typical disk request time that makes a disk "slow to respond".
+    pub disk_latency_ms: f32,
+    pub disk_latency_bad_ms: f32,
+    pub disk_queue_len: f32,
+    /// A short burst: CPU averaging this over `spike_secs` consecutive samples.
+    pub spike_cpu_pct: f32,
+    pub spike_secs: usize,
+    /// A single disk stall at least this long.
+    pub spike_disk_ms: f32,
 }
 
 impl Default for Thresholds {
@@ -34,6 +53,18 @@ impl Default for Thresholds {
             throttle_busy_pct: 60.0,
             throttle_clock_ratio: 0.75,
             disk_heavy_bps: 80 * 1024 * 1024,
+            hot_temp_c: 85.0,
+            very_hot_temp_c: 90.0,
+            state_fraction: 0.5,
+            battery_low_pct: 15,
+            gpu_busy_pct: 90.0,
+            gpu_hot_c: 85.0,
+            disk_latency_ms: 50.0,
+            disk_latency_bad_ms: 100.0,
+            disk_queue_len: 4.0,
+            spike_cpu_pct: 95.0,
+            spike_secs: 5,
+            spike_disk_ms: 300.0,
         }
     }
 }
@@ -56,8 +87,8 @@ pub fn hint_for(program: &str) -> Option<&'static str> {
     }
 }
 
-/// Per-program averages over the window. A sample that doesn't list a program
-/// counts as zero for it, so brief bursts are not overstated.
+/// Per-program averages over a set of samples. A sample that doesn't list a
+/// program counts as zero for it, so brief bursts are not overstated.
 #[derive(Debug, Clone)]
 struct ProgAvg {
     name: String,
@@ -68,7 +99,7 @@ struct ProgAvg {
 }
 
 fn per_program(samples: &[Sample]) -> Vec<ProgAvg> {
-    let n = samples.len() as f64;
+    let n = samples.len().max(1) as f64;
     let mut map: HashMap<&str, ProgAvg> = HashMap::new();
     for s in samples {
         for p in &s.procs {
@@ -107,6 +138,45 @@ fn mean<F: Fn(&Sample) -> f64>(samples: &[Sample], f: F) -> f64 {
     samples.iter().map(f).sum::<f64>() / samples.len() as f64
 }
 
+/// Average of a sensor over the samples that have it, with how many did.
+fn avg_of<F: Fn(&Sample) -> Option<f32>>(samples: &[Sample], f: F) -> Option<f32> {
+    let v: Vec<f32> = samples.iter().filter_map(&f).collect();
+    (!v.is_empty()).then(|| v.iter().sum::<f32>() / v.len() as f32)
+}
+
+/// Share of the samples that have a reading in which `pred` holds.
+fn share_of<F: Fn(&Sample) -> Option<bool>>(samples: &[Sample], f: F) -> Option<f32> {
+    let v: Vec<bool> = samples.iter().filter_map(&f).collect();
+    (!v.is_empty()).then(|| v.iter().filter(|b| **b).count() as f32 / v.len() as f32)
+}
+
+fn hms(ts: i64) -> String {
+    Local.timestamp_opt(ts, 0).single().map_or_else(|| ts.to_string(), |t| t.format("%H:%M:%S").to_string())
+}
+
+/// Finds the run of `k` consecutive samples (no gaps, so thinned history is
+/// skipped) with the highest average of `f`. Returns the start index and average.
+fn rolling_peak<F: Fn(&Sample) -> Option<f32>>(samples: &[Sample], k: usize, f: F) -> Option<(usize, f32)> {
+    if k == 0 || samples.len() < k {
+        return None;
+    }
+    let max_span = 2 * (k as i64 - 1);
+    let mut best: Option<(usize, f32)> = None;
+    for i in 0..=samples.len() - k {
+        let w = &samples[i..i + k];
+        if w[k - 1].ts - w[0].ts > max_span {
+            continue;
+        }
+        let vals: Option<Vec<f32>> = w.iter().map(&f).collect();
+        let Some(vals) = vals else { continue };
+        let m = vals.iter().sum::<f32>() / k as f32;
+        if best.map_or(true, |(_, b)| m > b) {
+            best = Some((i, m));
+        }
+    }
+    best
+}
+
 /// Explains a window of samples. `best_mhz` is the fastest clock ever recorded.
 /// Findings come back ranked, most likely first. Empty means no clear cause.
 pub fn analyze(samples: &[Sample], best_mhz: u32, t: &Thresholds) -> Vec<Finding> {
@@ -117,6 +187,14 @@ pub fn analyze(samples: &[Sample], best_mhz: u32, t: &Thresholds) -> Vec<Finding
     let avg_cpu = mean(samples, |s| s.cpu_pct as f64) as f32;
     let progs = per_program(samples);
     let machine_line = format!("whole machine averaged {:.0}% CPU", avg_cpu);
+
+    // Context shared by several rules.
+    let on_battery = share_of(samples, |s| s.sensors.on_ac.map(|a| !a)).is_some_and(|f| f >= 0.8);
+    let saver_on = share_of(samples, |s| s.sensors.battery_saver).is_some_and(|f| f >= t.state_fraction);
+    let battery_pct = avg_of(samples, |s| s.sensors.battery_pct.map(f32::from));
+    let temp = avg_of(samples, |s| s.sensors.temp_c);
+    let mut saver_explained = false;
+    let mut heat_explained = false;
 
     // 1. CPU hogs (up to two).
     let mut by_cpu: Vec<&ProgAvg> = progs.iter().filter(|p| p.cpu >= t.hog_cpu_pct).collect();
@@ -136,7 +214,8 @@ pub fn analyze(samples: &[Sample], best_mhz: u32, t: &Thresholds) -> Vec<Finding
     }
 
     // 2. Saturated by many programs.
-    if hogs == 0 && avg_cpu >= t.saturated_cpu_pct {
+    let saturated = hogs == 0 && avg_cpu >= t.saturated_cpu_pct;
+    if saturated {
         let mut top: Vec<&ProgAvg> = progs.iter().collect();
         top.sort_by(|a, b| b.cpu.total_cmp(&a.cpu));
         let mut evidence = vec![machine_line.clone()];
@@ -183,32 +262,170 @@ pub fn analyze(samples: &[Sample], best_mhz: u32, t: &Thresholds) -> Vec<Finding
         });
     }
 
-    // 4. Throttling, inferred from clock speed only.
-    let clocks: Vec<f64> = samples.iter().filter(|s| s.clock_mhz > 0).map(|s| s.clock_mhz as f64).collect();
-    if best_mhz > 0 && !clocks.is_empty() && avg_cpu >= t.throttle_busy_pct {
-        let avg_mhz = clocks.iter().sum::<f64>() / clocks.len() as f64;
-        let ratio = avg_mhz / best_mhz as f64;
-        if ratio <= t.throttle_clock_ratio as f64 {
+    // 4. CPU throttling. Prefer the OS's "percent of maximum frequency"; fall back
+    // to comparing against the fastest clock ever recorded.
+    let speed = avg_of(samples, |s| s.sensors.freq_pct).map(|f| {
+        (f / 100.0, format!("CPU ran at {f:.0}% of its rated maximum speed"), true)
+    });
+    let speed = speed.or_else(|| {
+        let clocks: Vec<f64> = samples.iter().filter(|s| s.clock_mhz > 0).map(|s| s.clock_mhz as f64).collect();
+        if best_mhz == 0 || clocks.is_empty() {
+            return None;
+        }
+        let avg = clocks.iter().sum::<f64>() / clocks.len() as f64;
+        let ratio = (avg / best_mhz as f64) as f32;
+        Some((ratio, format!("clock averaged {avg:.0} MHz, {:.0}% of the best seen ({best_mhz} MHz)", ratio * 100.0), false))
+    });
+    if let Some((ratio, speed_line, measured)) = speed {
+        if avg_cpu >= t.throttle_busy_pct && ratio <= t.throttle_clock_ratio {
+            let mut evidence = vec![format!("CPU was {avg_cpu:.0}% busy"), speed_line];
+            if let Some(c) = temp {
+                evidence.push(format!("temperature sensor averaged {c:.0}Â°C"));
+            }
+            let (title, confidence, hint, score);
+            if temp.is_some_and(|c| c >= t.hot_temp_c) {
+                heat_explained = true;
+                title = "CPU throttling, likely from heat";
+                confidence = Confidence::Medium;
+                hint = Some("Check the fans and vents for dust, use a hard flat surface or a cooling pad, and close heavy background programs.");
+                score = 56.0;
+            } else if saver_on {
+                saver_explained = true;
+                evidence.push("Battery Saver was on".into());
+                title = "CPU throttling, Battery Saver is limiting performance";
+                confidence = Confidence::Medium;
+                hint = Some("Turn Battery Saver off (Settings > System > Power & battery) or plug in.");
+                score = 56.0;
+            } else if on_battery {
+                evidence.push(match battery_pct {
+                    Some(b) => format!("running on battery at {b:.0}%"),
+                    None => "running on battery".into(),
+                });
+                title = "CPU throttling, likely battery power limits";
+                confidence = Confidence::Medium;
+                hint = Some("Plug in, and set the power mode to Best performance (Settings > System > Power & battery).");
+                score = 54.0;
+            } else {
+                if !measured {
+                    evidence.push("inferred from clock speed only; can't tell heat from power limits".into());
+                }
+                title = "Probable CPU throttling";
+                confidence = Confidence::Low;
+                hint = None;
+                score = 40.0 + (1.0 - ratio) * 20.0;
+            }
             out.push(Finding {
-                title: "Probable CPU throttling".into(),
-                evidence: vec![
-                    format!("CPU was {:.0}% busy", avg_cpu),
-                    format!(
-                        "clock averaged {:.0} MHz, {:.0}% of the best seen ({} MHz)",
-                        avg_mhz,
-                        ratio * 100.0,
-                        best_mhz
-                    ),
-                    "inferred from clock speed only; can't tell heat from power limits or battery saver".into(),
-                ],
-                confidence: Confidence::Low,
-                hint: None,
-                score: 40.0 + (1.0 - ratio as f32) * 20.0,
+                title: title.into(),
+                evidence,
+                confidence,
+                hint: hint.map(str::to_string),
+                score,
             });
         }
     }
 
-    // 5. Heavy disk activity.
+    // 5. Battery Saver on while the machine was working (when not already blamed above).
+    if saver_on && !saver_explained && avg_cpu >= 30.0 {
+        let mut evidence = vec!["Windows Battery Saver was on".into(), machine_line.clone()];
+        if let Some(b) = battery_pct {
+            evidence.push(format!("battery at {b:.0}%"));
+        }
+        out.push(Finding {
+            title: "Battery Saver was limiting performance".into(),
+            evidence,
+            confidence: Confidence::Low,
+            hint: Some("Turn Battery Saver off (Settings > System > Power & battery) or plug in.".into()),
+            score: 38.0,
+        });
+    } else if on_battery && !saver_on && !saver_explained && avg_cpu >= 30.0 && battery_pct.is_some_and(|b| b <= t.battery_low_pct as f32) {
+        out.push(Finding {
+            title: "Running on a nearly empty battery".into(),
+            evidence: vec![
+                format!("battery averaged {:.0}%", battery_pct.unwrap_or(0.0)),
+                "not plugged in".into(),
+                machine_line.clone(),
+            ],
+            confidence: Confidence::Low,
+            hint: Some("Windows cuts performance on a low battery. Plug in.".into()),
+            score: 30.0,
+        });
+    }
+
+    // 6. Running hot, when it wasn't already the explanation for throttling.
+    if let Some(c) = temp.filter(|c| *c >= t.very_hot_temp_c && !heat_explained) {
+        out.push(Finding {
+            title: "The machine was running very hot".into(),
+            evidence: vec![
+                format!("temperature sensor averaged {c:.0}Â°C"),
+                "the sensor is a system thermal zone, which may not be the CPU core itself".into(),
+            ],
+            confidence: Confidence::Low,
+            hint: Some("Check the fans and vents for dust, and use a hard flat surface or a cooling pad.".into()),
+            score: 42.0,
+        });
+    }
+
+    // 7. GPU: throttled, hot, or simply saturated.
+    let gpu = avg_of(samples, |s| s.sensors.gpu_pct);
+    let gpu_temp = avg_of(samples, |s| s.sensors.gpu_temp_c);
+    let thr_share = |bit: u8| share_of(samples, |s| s.sensors.gpu_throttle.map(|g| g & bit != 0)).unwrap_or(0.0);
+    let (thermal, power, hw) = (thr_share(GPU_THERMAL), thr_share(GPU_POWER), thr_share(GPU_HW));
+    let gpu_throttled = thermal.max(power).max(hw) >= t.state_fraction && gpu.is_some_and(|g| g >= 50.0);
+    let gpu_hot = gpu_temp.is_some_and(|c| c >= t.gpu_hot_c);
+    if gpu_throttled {
+        let mut evidence = vec![format!("GPU averaged {:.0}% busy", gpu.unwrap_or(0.0))];
+        let (title, hint) = if thermal >= t.state_fraction || (gpu_hot && hw >= t.state_fraction) {
+            evidence.push(format!("GPU reported thermal throttling in {:.0}% of samples", thermal.max(hw) * 100.0));
+            (
+                "GPU throttled by heat",
+                "Improve airflow, use a cooling pad, or lower graphics settings and frame-rate caps.",
+            )
+        } else if power >= t.state_fraction {
+            evidence.push(format!("GPU reported a power cap in {:.0}% of samples", power * 100.0));
+            if on_battery {
+                evidence.push("running on battery".into());
+            }
+            (
+                "GPU limited by its power budget",
+                "Plug in the charger and set the power mode to Best performance. Laptops cut GPU power on battery.",
+            )
+        } else {
+            evidence.push(format!("GPU reported a hardware slowdown in {:.0}% of samples", hw * 100.0));
+            ("GPU slowed by a hardware limit (heat or power)", "Plug in, check cooling, and lower graphics settings.")
+        };
+        if let Some(c) = gpu_temp {
+            evidence.push(format!("GPU temperature averaged {c:.0}Â°C"));
+        }
+        out.push(Finding {
+            title: title.into(),
+            evidence,
+            confidence: Confidence::Medium,
+            hint: Some(hint.into()),
+            score: 57.0,
+        });
+    } else if gpu.is_some_and(|g| g >= t.gpu_busy_pct) {
+        let mut evidence = vec![format!("GPU averaged {:.0}% busy", gpu.unwrap_or(0.0))];
+        if let Some(c) = gpu_temp {
+            evidence.push(format!("GPU temperature averaged {c:.0}Â°C"));
+        }
+        out.push(Finding {
+            title: "The GPU was maxed out".into(),
+            evidence,
+            confidence: Confidence::Medium,
+            hint: Some("Lower graphics settings or resolution, or close other GPU-heavy programs (games, video, browser tabs).".into()),
+            score: 52.0,
+        });
+    } else if gpu_hot {
+        out.push(Finding {
+            title: "The GPU was running very hot".into(),
+            evidence: vec![format!("GPU temperature averaged {:.0}Â°C", gpu_temp.unwrap_or(0.0))],
+            confidence: Confidence::Low,
+            hint: Some("Improve airflow or use a cooling pad.".into()),
+            score: 41.0,
+        });
+    }
+
+    // 8. Heavy disk activity (throughput).
     let disk = mean(samples, |s| s.disk_bps as f64);
     if disk >= t.disk_heavy_bps as f64 {
         let top = progs.iter().max_by(|a, b| a.disk_bps.total_cmp(&b.disk_bps));
@@ -227,14 +444,131 @@ pub fn analyze(samples: &[Sample], best_mhz: u32, t: &Thresholds) -> Vec<Finding
         });
     }
 
+    // 9. Slow disk: requests took a long time even if little data moved. Seconds
+    // with no I/O read as zero, so only count seconds where the disk was used.
+    let busy_latencies: Vec<f32> = samples.iter().filter_map(|s| s.sensors.disk_latency_ms).filter(|l| *l > 0.0).collect();
+    let queue = avg_of(samples, |s| s.sensors.disk_queue);
+    let lat_avg = (busy_latencies.len() >= 3).then(|| busy_latencies.iter().sum::<f32>() / busy_latencies.len() as f32);
+    let slow_disk = lat_avg.is_some_and(|l| l >= t.disk_latency_ms);
+    if slow_disk || queue.is_some_and(|q| q >= t.disk_queue_len) {
+        let mut evidence = Vec::new();
+        if let Some(l) = lat_avg {
+            evidence.push(format!("disk requests took {l:.0} ms on average (healthy is a few ms)"));
+        }
+        if let Some(q) = queue {
+            evidence.push(format!("average of {q:.1} requests waiting in the queue"));
+        }
+        if disk > 0.0 {
+            evidence.push(format!("only {:.0} MB/s was moving", disk / MB));
+        }
+        let top = progs.iter().max_by(|a, b| a.disk_bps.total_cmp(&b.disk_bps)).filter(|p| p.disk_bps > 0.0);
+        let mut hint = None;
+        if let Some(p) = top {
+            evidence.push(format!("most I/O: {} at {:.1} MB/s", label(p), p.disk_bps / MB));
+            hint = hint_for(&p.name).map(str::to_string);
+        }
+        out.push(Finding {
+            title: "The disk was slow to respond".into(),
+            evidence,
+            confidence: if lat_avg.is_some_and(|l| l >= t.disk_latency_bad_ms) { Confidence::High } else { Confidence::Medium },
+            hint: hint.or_else(|| Some("Programs were waiting on the disk. Check that it isn't nearly full, and look for a failing drive.".into())),
+            score: 54.0 + lat_avg.unwrap_or(0.0).min(200.0) / 20.0,
+        });
+    }
+
+    // 10. Short spikes the window average hides.
+    if hogs == 0 && !saturated {
+        if let Some((i, peak)) = rolling_peak(samples, t.spike_secs, |s| Some(s.cpu_pct)).filter(|(_, p)| *p >= t.spike_cpu_pct) {
+            let w = &samples[i..i + t.spike_secs];
+            let mut top = per_program(w);
+            top.sort_by(|a, b| b.cpu.total_cmp(&a.cpu));
+            let mut evidence = vec![
+                format!("{} to {}: CPU averaged {:.0}%", hms(w[0].ts), hms(w[w.len() - 1].ts), peak),
+                format!("the whole window averaged only {avg_cpu:.0}%, so the burst is easy to miss"),
+            ];
+            let mut hint = Some(format!("Run `bb why {} --span 30s` to zoom in.", hms(w[w.len() / 2].ts)));
+            if let Some(p) = top.first().filter(|p| p.cpu > 5.0) {
+                evidence.push(format!("busiest then: {} at {:.0}%", label(p), p.cpu));
+                if let Some(h) = hint_for(&p.name) {
+                    hint = Some(format!("{h} {}", hint.unwrap_or_default()));
+                }
+            }
+            out.push(Finding {
+                title: format!("A short CPU spike around {}", hms(w[w.len() / 2].ts)),
+                evidence,
+                confidence: Confidence::Medium,
+                hint,
+                score: 45.0,
+            });
+        }
+    }
+    if !slow_disk {
+        let worst = samples
+            .iter()
+            .enumerate()
+            .filter_map(|(i, s)| s.sensors.disk_latency_ms.map(|l| (i, l)))
+            .max_by(|a, b| a.1.total_cmp(&b.1))
+            .filter(|(_, l)| *l >= t.spike_disk_ms);
+        if let Some((i, l)) = worst {
+            let s = &samples[i];
+            let mut evidence = vec![format!("disk requests took {l:.0} ms at {} (healthy is a few ms)", hms(s.ts))];
+            if let Some(p) = s.procs.iter().max_by_key(|p| p.disk_bps).filter(|p| p.disk_bps > 0) {
+                evidence.push(format!("most I/O then: {}", p.name));
+            }
+            out.push(Finding {
+                title: format!("A brief disk stall around {}", hms(s.ts)),
+                evidence,
+                confidence: Confidence::Medium,
+                hint: Some(format!("Run `bb why {} --span 30s` to zoom in.", hms(s.ts))),
+                score: 44.0,
+            });
+        }
+    }
+
+    // 11. A hole in the recording. The recorder samples every second, so a gap
+    // means the whole machine, recorder included, was stalled (or asleep).
+    if let Some((from, to)) = largest_gap(samples) {
+        let secs = to - from;
+        out.push(Finding {
+            title: format!("The machine stalled around {}", hms(from)),
+            evidence: vec![
+                format!("nothing was recorded between {} and {} ({secs} s)", hms(from), hms(to)),
+                "the recorder samples every second, so the whole machine, including the recorder, was stuck".into(),
+                "a laptop that went to sleep briefly also looks like this".into(),
+            ],
+            confidence: if secs <= 20 { Confidence::Medium } else { Confidence::Low },
+            hint: Some(format!("Look at what happened just before: `bb why {} --span 30s`.", hms(from))),
+            score: 46.0,
+        });
+    }
+
     out.sort_by(|a, b| b.score.total_cmp(&a.score));
     out
+}
+
+/// The biggest gap (5 to 60 s) between consecutive samples, if the window was
+/// recorded at full resolution. Longer gaps are sleep or a stopped recorder, and
+/// thinned history has gaps by design.
+fn largest_gap(samples: &[Sample]) -> Option<(i64, i64)> {
+    let diffs: Vec<i64> = samples.windows(2).map(|w| w[1].ts - w[0].ts).collect();
+    if diffs.is_empty() {
+        return None;
+    }
+    let mut sorted = diffs.clone();
+    sorted.sort_unstable();
+    let median = sorted[sorted.len() / 2];
+    if median > 2 {
+        return None;
+    }
+    let min_gap = 5.max(median * 3);
+    let (i, gap) = diffs.iter().enumerate().max_by_key(|(_, d)| **d).map(|(i, d)| (i, *d))?;
+    (gap >= min_gap && gap <= 60).then(|| (samples[i].ts, samples[i + 1].ts))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::ProcRow;
+    use crate::model::{ProcRow, Sensors};
 
     fn proc(name: &str, count: u32, cpu: f32, disk_mb: u64, mem_gb: f64) -> ProcRow {
         ProcRow {
@@ -247,7 +581,7 @@ mod tests {
     }
 
     /// 60 seconds of a healthy 16 GB machine, with `tweak` applied to each sample.
-    fn window(tweak: impl Fn(&mut Sample)) -> Vec<Sample> {
+    fn window(mut tweak: impl FnMut(&mut Sample)) -> Vec<Sample> {
         (0..60)
             .map(|i| {
                 let mut s = Sample {
@@ -258,6 +592,7 @@ mod tests {
                     swap_used: 0,
                     clock_mhz: 3600,
                     disk_bps: 2 << 20,
+                    sensors: Sensors::default(),
                     procs: vec![proc("code.exe", 6, 4.0, 1, 1.0)],
                 };
                 tweak(&mut s);
@@ -266,13 +601,45 @@ mod tests {
             .collect()
     }
 
+    /// Like `window`, but `tweak` also gets the index, to build bursts.
+    fn window_i(tweak: impl Fn(usize, &mut Sample)) -> Vec<Sample> {
+        let mut i = 0;
+        window(|s| {
+            tweak(i, s);
+            i += 1;
+        })
+    }
+
     fn run(w: &[Sample]) -> Vec<Finding> {
         analyze(w, 3600, &Thresholds::default())
+    }
+
+    fn titles(f: &[Finding]) -> Vec<&str> {
+        f.iter().map(|f| f.title.as_str()).collect()
     }
 
     #[test]
     fn healthy_machine_has_no_findings() {
         assert!(run(&window(|_| {})).is_empty());
+    }
+
+    #[test]
+    fn healthy_machine_with_all_sensors_has_no_findings() {
+        let w = window(|s| {
+            s.sensors = Sensors {
+                on_ac: Some(true),
+                battery_pct: Some(90),
+                battery_saver: Some(false),
+                temp_c: Some(55.0),
+                freq_pct: Some(70.0),
+                gpu_pct: Some(5.0),
+                gpu_temp_c: Some(45.0),
+                gpu_throttle: Some(0),
+                disk_queue: Some(0.1),
+                disk_latency_ms: Some(1.5),
+            }
+        });
+        assert!(run(&w).is_empty(), "{:?}", titles(&run(&w)));
     }
 
     #[test]
@@ -306,16 +673,11 @@ mod tests {
     #[test]
     fn short_burst_is_diluted_not_blamed() {
         // A hog present for only 10 of 60 seconds averages ~8%.
-        let w: Vec<Sample> = window(|_| {})
-            .into_iter()
-            .enumerate()
-            .map(|(i, mut s)| {
-                if i < 10 {
-                    s.procs.push(proc("burst.exe", 1, 50.0, 0, 0.1));
-                }
-                s
-            })
-            .collect();
+        let w = window_i(|i, s| {
+            if i < 10 {
+                s.procs.push(proc("burst.exe", 1, 50.0, 0, 0.1));
+            }
+        });
         assert!(run(&w).is_empty());
     }
 
@@ -408,5 +770,282 @@ mod tests {
         assert!(f.len() >= 3);
         assert!(f.windows(2).all(|p| p[0].score >= p[1].score));
         assert!(f[0].title.starts_with("hog.exe"));
+    }
+
+    // ---- sensors: power, heat, GPU, disk latency, spikes ----
+
+    /// A busy CPU with two mid-sized programs, so no single hog and no saturation.
+    fn busy(s: &mut Sample) {
+        s.cpu_pct = 70.0;
+        s.procs = vec![proc("a.exe", 1, 20.0, 0, 0.1), proc("b.exe", 1, 20.0, 0, 0.1)];
+    }
+
+    #[test]
+    fn measured_throttle_on_battery_blames_power_limits() {
+        let w = window(|s| {
+            busy(s);
+            s.sensors = Sensors { freq_pct: Some(48.0), on_ac: Some(false), battery_pct: Some(55), battery_saver: Some(false), ..Default::default() };
+        });
+        let f = run(&w);
+        assert_eq!(f.len(), 1, "{:?}", titles(&f));
+        assert!(f[0].title.contains("battery power limits"));
+        assert_eq!(f[0].confidence, Confidence::Medium);
+        assert!(f[0].hint.as_ref().unwrap().contains("Plug in"));
+        assert!(f[0].evidence.iter().any(|e| e.contains("48%")));
+    }
+
+    #[test]
+    fn measured_throttle_when_hot_blames_heat() {
+        let w = window(|s| {
+            busy(s);
+            s.sensors = Sensors { freq_pct: Some(50.0), temp_c: Some(92.0), on_ac: Some(true), ..Default::default() };
+        });
+        let f = run(&w);
+        // Heat explains the throttling, so there is no separate "very hot" finding.
+        assert_eq!(f.len(), 1, "{:?}", titles(&f));
+        assert!(f[0].title.contains("heat"));
+        assert!(f[0].evidence.iter().any(|e| e.contains("92")));
+    }
+
+    #[test]
+    fn measured_throttle_with_battery_saver_blames_saver() {
+        let w = window(|s| {
+            busy(s);
+            s.sensors = Sensors { freq_pct: Some(40.0), battery_saver: Some(true), on_ac: Some(false), ..Default::default() };
+        });
+        let f = run(&w);
+        assert_eq!(f.len(), 1, "{:?}", titles(&f));
+        assert!(f[0].title.contains("Battery Saver"));
+    }
+
+    #[test]
+    fn measured_throttle_with_no_cause_is_low_confidence() {
+        let w = window(|s| {
+            busy(s);
+            s.sensors = Sensors { freq_pct: Some(50.0), on_ac: Some(true), temp_c: Some(60.0), ..Default::default() };
+        });
+        let f = run(&w);
+        assert_eq!(f.len(), 1);
+        assert_eq!(f[0].confidence, Confidence::Low);
+    }
+
+    #[test]
+    fn measured_frequency_beats_the_clock_guess() {
+        // The clock looks throttled, but the OS says the CPU ran at full speed.
+        let w = window(|s| {
+            busy(s);
+            s.clock_mhz = 1500;
+            s.sensors.freq_pct = Some(100.0);
+        });
+        assert!(run(&w).is_empty());
+    }
+
+    #[test]
+    fn idle_low_frequency_is_not_throttling() {
+        assert!(run(&window(|s| s.sensors.freq_pct = Some(30.0))).is_empty());
+    }
+
+    #[test]
+    fn battery_saver_while_working_is_reported() {
+        let w = window(|s| {
+            s.cpu_pct = 40.0;
+            s.sensors = Sensors { battery_saver: Some(true), on_ac: Some(false), battery_pct: Some(70), ..Default::default() };
+        });
+        let f = run(&w);
+        assert_eq!(f.len(), 1);
+        assert!(f[0].title.contains("Battery Saver"));
+        assert!(f[0].hint.as_ref().unwrap().contains("Settings"));
+    }
+
+    #[test]
+    fn battery_saver_while_idle_is_not_reported() {
+        let w = window(|s| s.sensors = Sensors { battery_saver: Some(true), on_ac: Some(false), ..Default::default() });
+        assert!(run(&w).is_empty());
+    }
+
+    #[test]
+    fn nearly_empty_battery_is_low_confidence() {
+        let w = window(|s| {
+            s.cpu_pct = 40.0;
+            s.sensors = Sensors { on_ac: Some(false), battery_pct: Some(9), battery_saver: Some(false), ..Default::default() };
+        });
+        let f = run(&w);
+        assert_eq!(f.len(), 1);
+        assert!(f[0].title.contains("nearly empty"));
+        assert_eq!(f[0].confidence, Confidence::Low);
+    }
+
+    #[test]
+    fn plugged_in_machine_gets_no_battery_findings() {
+        let w = window(|s| {
+            s.cpu_pct = 40.0;
+            s.sensors = Sensors { on_ac: Some(true), battery_pct: Some(5), battery_saver: Some(false), ..Default::default() };
+        });
+        assert!(run(&w).is_empty());
+    }
+
+    #[test]
+    fn very_hot_machine_without_throttling_is_flagged() {
+        let w = window(|s| s.sensors.temp_c = Some(95.0));
+        let f = run(&w);
+        assert_eq!(f.len(), 1);
+        assert!(f[0].title.contains("very hot"));
+    }
+
+    #[test]
+    fn gpu_maxed_out() {
+        let w = window(|s| s.sensors = Sensors { gpu_pct: Some(98.0), gpu_temp_c: Some(70.0), gpu_throttle: Some(0), ..Default::default() });
+        let f = run(&w);
+        assert_eq!(f.len(), 1);
+        assert!(f[0].title.contains("GPU was maxed out"));
+    }
+
+    #[test]
+    fn gpu_thermal_throttle_beats_plain_saturation() {
+        let w = window(|s| {
+            s.sensors = Sensors { gpu_pct: Some(99.0), gpu_temp_c: Some(88.0), gpu_throttle: Some(GPU_THERMAL), ..Default::default() }
+        });
+        let f = run(&w);
+        assert_eq!(f.len(), 1, "{:?}", titles(&f));
+        assert!(f[0].title.contains("GPU throttled by heat"));
+        assert!(f[0].evidence.iter().any(|e| e.contains("88")));
+    }
+
+    #[test]
+    fn gpu_power_cap_on_battery() {
+        let w = window(|s| {
+            s.sensors = Sensors { gpu_pct: Some(80.0), gpu_throttle: Some(GPU_POWER), on_ac: Some(false), ..Default::default() }
+        });
+        let f = run(&w);
+        assert_eq!(f.len(), 1, "{:?}", titles(&f));
+        assert!(f[0].title.contains("power budget"));
+        assert!(f[0].evidence.iter().any(|e| e.contains("battery")));
+    }
+
+    #[test]
+    fn idle_gpu_with_throttle_flags_is_not_reported() {
+        // Drivers report power caps at idle all the time.
+        let w = window(|s| s.sensors = Sensors { gpu_pct: Some(3.0), gpu_throttle: Some(GPU_POWER), ..Default::default() });
+        assert!(run(&w).is_empty());
+    }
+
+    #[test]
+    fn slow_disk_with_little_data_moving() {
+        let w = window(|s| {
+            s.disk_bps = 1 << 20;
+            s.sensors = Sensors { disk_latency_ms: Some(180.0), disk_queue: Some(6.0), ..Default::default() };
+            s.procs.push(proc("MsMpEng.exe", 1, 3.0, 5, 0.3));
+        });
+        let f = run(&w);
+        assert_eq!(f.len(), 1, "{:?}", titles(&f));
+        assert!(f[0].title.contains("slow to respond"));
+        assert_eq!(f[0].confidence, Confidence::High);
+        assert!(f[0].evidence.iter().any(|e| e.contains("180")));
+        assert!(f[0].hint.as_ref().unwrap().contains("Exclusions"));
+    }
+
+    #[test]
+    fn idle_seconds_do_not_dilute_disk_latency() {
+        // Disk used in 20 of 60 seconds, slow each time. The idle seconds read 0 ms.
+        let w = window_i(|i, s| s.sensors.disk_latency_ms = Some(if i % 3 == 0 { 120.0 } else { 0.0 }));
+        let f = run(&w);
+        assert!(titles(&f).iter().any(|t| t.contains("slow to respond")), "{:?}", titles(&f));
+    }
+
+    #[test]
+    fn healthy_disk_latency_is_quiet() {
+        let w = window(|s| s.sensors = Sensors { disk_latency_ms: Some(2.0), disk_queue: Some(0.2), ..Default::default() });
+        assert!(run(&w).is_empty());
+    }
+
+    #[test]
+    fn short_cpu_spike_is_found_in_a_calm_window() {
+        // 6 seconds at 99% inside 60. The average is ~19%.
+        let w = window_i(|i, s| {
+            if (30..36).contains(&i) {
+                s.cpu_pct = 99.0;
+                s.procs.push(proc("build.exe", 4, 80.0, 0, 0.5));
+            }
+        });
+        let f = run(&w);
+        assert_eq!(f.len(), 1, "{:?}", titles(&f));
+        assert!(f[0].title.contains("short CPU spike"));
+        assert!(f[0].evidence.iter().any(|e| e.contains("build.exe")));
+        assert!(f[0].hint.as_ref().unwrap().contains("--span 30s"));
+    }
+
+    #[test]
+    fn two_second_blip_is_not_a_spike() {
+        let w = window_i(|i, s| {
+            if (30..32).contains(&i) {
+                s.cpu_pct = 100.0;
+            }
+        });
+        assert!(run(&w).is_empty());
+    }
+
+    #[test]
+    fn spike_is_not_reported_when_a_hog_already_explains_the_window() {
+        let w = window(|s| {
+            s.cpu_pct = 99.0;
+            s.procs.push(proc("hog.exe", 1, 90.0, 0, 0.1));
+        });
+        let f = run(&w);
+        assert_eq!(f.len(), 1);
+        assert!(!f[0].title.contains("spike"));
+    }
+
+    #[test]
+    fn thinned_history_cannot_fake_a_spike() {
+        // Samples 10 s apart (old, thinned data): five of them are not a 5 s burst.
+        let w: Vec<Sample> = (0..30)
+            .map(|i| Sample { ts: 1000 + i * 10, cpu_pct: if (10..15).contains(&i) { 99.0 } else { 10.0 }, mem_total: 16 << 30, ..Default::default() })
+            .collect();
+        assert!(run(&w).is_empty(), "{:?}", titles(&run(&w)));
+    }
+
+    #[test]
+    fn brief_disk_stall_is_found() {
+        let w = window_i(|i, s| {
+            s.sensors.disk_latency_ms = Some(if i == 40 { 650.0 } else { 3.0 });
+        });
+        let f = run(&w);
+        assert_eq!(f.len(), 1, "{:?}", titles(&f));
+        assert!(f[0].title.contains("disk stall"));
+        assert!(f[0].evidence[0].contains("650"));
+    }
+
+    #[test]
+    fn rolling_peak_needs_contiguous_samples() {
+        let w: Vec<Sample> = (0..4).map(|i| Sample { ts: i * 10, cpu_pct: 99.0, ..Default::default() }).collect();
+        assert!(rolling_peak(&w, 3, |s| Some(s.cpu_pct)).is_none());
+        let w: Vec<Sample> = (0..4).map(|i| Sample { ts: i, cpu_pct: 99.0, ..Default::default() }).collect();
+        assert_eq!(rolling_peak(&w, 3, |s| Some(s.cpu_pct)).map(|(_, v)| v), Some(99.0));
+    }
+
+    #[test]
+    fn a_hole_in_the_recording_is_reported() {
+        let w: Vec<Sample> = (0..60i64)
+            .filter(|i| !(30..38).contains(i))
+            .map(|i| Sample { ts: 1000 + i, cpu_pct: 8.0, mem_total: 16 << 30, ..Default::default() })
+            .collect();
+        let f = run(&w);
+        assert_eq!(f.len(), 1, "{:?}", titles(&f));
+        assert!(f[0].title.contains("stalled"));
+        assert!(f[0].evidence[0].contains("9 s"));
+        assert_eq!(f[0].confidence, Confidence::Medium);
+    }
+
+    #[test]
+    fn small_gaps_sleep_and_thinned_history_are_not_stalls() {
+        let make = |ts: Vec<i64>| -> Vec<Sample> {
+            ts.into_iter().map(|t| Sample { ts: t, cpu_pct: 8.0, mem_total: 16 << 30, ..Default::default() }).collect()
+        };
+        // 3 s gap: just a late sample.
+        assert!(run(&make((0..30).filter(|i| ![10, 11].contains(i)).collect())).is_empty());
+        // 10 minutes: asleep or stopped, not a stall.
+        assert!(run(&make((0..30).chain(630..660).collect())).is_empty());
+        // Thinned history sampled every 10 s.
+        assert!(run(&make((0..30).map(|i| i * 10).collect())).is_empty());
     }
 }

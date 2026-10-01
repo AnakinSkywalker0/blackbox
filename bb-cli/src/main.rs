@@ -1,6 +1,7 @@
 mod install;
 
-use bb_core::model::Sample;
+use bb_core::model::{Sample, Sensors, GPU_HW, GPU_POWER, GPU_THERMAL};
+use bb_core::sensors::SensorReader;
 use bb_core::rules::{analyze, Thresholds};
 use bb_core::sampler::Sampler;
 use bb_core::store::{default_db_path, Store};
@@ -91,6 +92,8 @@ enum Cmd {
     },
     /// Show what has been recorded
     Status,
+    /// Show which sensors (battery, temperature, GPU, disk latency) work on this machine
+    Sensors,
     /// Measure blackbox's own cost on this machine
     Bench {
         /// How long to measure, in seconds
@@ -111,6 +114,7 @@ fn main() {
         Cmd::Top { n, watch } => top(n, watch),
         Cmd::Why { when, span } => why(&db, &when, &span),
         Cmd::Status => status(&db),
+        Cmd::Sensors => sensors(),
         Cmd::Bench { secs } => bench(secs),
     };
     if let Err(e) = result {
@@ -160,6 +164,7 @@ fn sleep_until(deadline: Instant, stop: &AtomicBool) {
 fn run(db: &std::path::Path, interval: u64, retention_days: u32, top_n: usize) -> Res {
     let interval = Duration::from_secs(interval.max(1));
     let _pid = install::PidGuard::acquire(db)?;
+    bb_core::sampler::raise_priority();
     let mut store = open(db)?;
     let stop = stop_flag();
     let mut sampler = Sampler::new(top_n);
@@ -198,12 +203,71 @@ fn run(db: &std::path::Path, interval: u64, retention_days: u32, top_n: usize) -
     Ok(())
 }
 
+/// One line per sensor: its label and reading, or None when unavailable.
+fn describe(x: &Sensors) -> Vec<(&'static str, Option<String>)> {
+    let power = x.on_ac.map(|ac| {
+        let state = if ac { "plugged in" } else { "on battery" };
+        let saver = if x.battery_saver == Some(true) { ", Battery Saver on" } else { "" };
+        match x.battery_pct {
+            Some(b) => format!("{b}%, {state}{saver}"),
+            None => format!("{state}{saver}"),
+        }
+    });
+    let gpu_throttle = x.gpu_throttle.map(|g| {
+        let mut why = Vec::new();
+        if g & GPU_THERMAL != 0 { why.push("heat"); }
+        if g & GPU_POWER != 0 { why.push("power cap"); }
+        if g & GPU_HW != 0 { why.push("hardware slowdown"); }
+        if why.is_empty() { "none".to_string() } else { why.join(", ") }
+    });
+    vec![
+        ("Battery / power", power),
+        ("Temperature", x.temp_c.map(|c| format!("{c:.0} C (hottest system sensor)"))),
+        ("CPU speed", x.freq_pct.map(|f| format!("{f:.0}% of rated maximum"))),
+        ("GPU load", x.gpu_pct.map(|g| format!("{g:.0}%"))),
+        ("GPU temperature", x.gpu_temp_c.map(|c| format!("{c:.0} C"))),
+        ("GPU throttling", gpu_throttle),
+        ("Disk latency", x.disk_latency_ms.map(|l| format!("{l:.1} ms per request"))),
+        ("Disk queue", x.disk_queue.map(|q| format!("{q:.2} requests waiting"))),
+    ]
+}
+
+fn sensors() -> Res {
+    let mut r = SensorReader::new();
+    r.read(); // rate counters need a first reading to measure against
+    std::thread::sleep(Duration::from_secs(1));
+    let x = r.read();
+    println!("Sensor readings on this machine:\n");
+    let rows = describe(&x);
+    for (label, v) in &rows {
+        match v {
+            Some(v) => println!("  {label:<16} {v}"),
+            None => println!("  {label:<16} not available"),
+        }
+    }
+    if let Some(name) = r.gpu_name() {
+        println!("\nNVIDIA GPU monitored: {name}");
+    }
+    let missing = rows.iter().filter(|(_, v)| v.is_none()).count();
+    if missing > 0 {
+        println!("\n{missing} sensor(s) unavailable. `bb why` simply skips rules that need them.");
+    }
+    Ok(())
+}
+
 fn print_top(s: &Sample, n: usize) {
     println!(
         "CPU {:.0}%   memory {} / {}   swap {}   clock {} MHz   disk {}/s",
         s.cpu_pct, fmt_bytes(s.mem_used), fmt_bytes(s.mem_total),
         fmt_bytes(s.swap_used), s.clock_mhz, fmt_bytes(s.disk_bps)
     );
+    let extras: Vec<String> = describe(&s.sensors)
+        .into_iter()
+        .filter_map(|(l, v)| v.map(|v| format!("{l}: {v}")))
+        .collect();
+    if !extras.is_empty() {
+        println!("{}", extras.join("   "));
+    }
     let mut rows = s.procs.clone();
     rows.sort_by(|a, b| b.cpu_pct.total_cmp(&a.cpu_pct).then(b.mem_bytes.cmp(&a.mem_bytes)));
     println!("\n{:<34} {:>6} {:>10} {:>10}", "PROGRAM", "CPU%", "MEMORY", "DISK/s");
@@ -264,8 +328,8 @@ fn why(db: &std::path::Path, when: &str, span: &str) -> Res {
     let best = store.best_mhz().map_err(|e| e.to_string())?;
     let findings = analyze(&samples, best, &Thresholds::default());
     if findings.is_empty() {
-        println!("No clear cause. CPU, memory, disk and clock speed all looked normal in this window.");
-        println!("Try a shorter or different --span. It may also be something v0.1 can't see (GPU, heat, network).");
+        println!("No clear cause. CPU, memory, disk, GPU, heat and power all looked normal in this window.");
+        println!("Try a shorter or different --span. It may also be something blackbox can't see yet (network, or a sensor `bb sensors` shows as unavailable).");
         return Ok(());
     }
     println!("Most likely causes:\n");
@@ -354,3 +418,6 @@ fn bench_inner(path: &std::path::Path, secs: u64) -> Res {
     println!("Memory:            about {} resident", fmt_bytes(rss));
     Ok(())
 }
+
+
+

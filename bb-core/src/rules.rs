@@ -25,6 +25,9 @@ pub struct Thresholds {
     /// Speed at or below this fraction of the maximum means throttling.
     pub throttle_clock_ratio: f32,
     pub disk_heavy_bps: u64,
+    /// The disk was busy this share of the time for a few seconds. Unlike throughput this
+    /// means the same on a slow disk and a fast one.
+    pub disk_busy_pct: f32,
     /// Temperature at which throttling is blamed on heat.
     pub hot_temp_c: f32,
     /// Temperature worth reporting even without a visible slowdown.
@@ -57,6 +60,7 @@ impl Default for Thresholds {
             throttle_busy_pct: 60.0,
             throttle_clock_ratio: 0.75,
             disk_heavy_bps: 80 * 1024 * 1024,
+            disk_busy_pct: 90.0,
             hot_temp_c: 85.0,
             very_hot_temp_c: 90.0,
             state_fraction: 0.5,
@@ -522,11 +526,16 @@ pub fn analyze(samples: &[Sample], best_mhz: u32, t: &Thresholds) -> Vec<Finding
         });
     }
 
-    // 8. Heavy disk activity (throughput).
+    // 8. Heavy disk activity: lots of data moving, or the disk busy nearly all the time.
     let disk = mean(samples, |s| s.disk_bps as f64);
-    if disk >= t.disk_heavy_bps as f64 {
+    let busy_peak = rolling_peak(samples, 5, |s| s.sensors.disk_busy).map(|(_, b)| b);
+    let disk_saturated = busy_peak.is_some_and(|b| b >= t.disk_busy_pct);
+    if disk >= t.disk_heavy_bps as f64 || disk_saturated {
         let top = progs.iter().max_by(|a, b| a.disk_bps.total_cmp(&b.disk_bps));
         let mut evidence = vec![format!("disk throughput averaged {:.0} MB/s", disk / MB)];
+        if let Some(b) = busy_peak.filter(|_| disk_saturated) {
+            evidence.push(format!("the disk was busy {b:.0}% of the time at its worst"));
+        }
         let mut hint = None;
         if let Some(p) = top.filter(|p| p.disk_bps > 0.0) {
             evidence.push(format!("most I/O: {} at {:.0} MB/s", label(p), p.disk_bps / MB));
@@ -756,6 +765,7 @@ mod tests {
                 disk_queue: Some(0.1),
                 disk_latency_ms: Some(1.5),
                 page_out: Some(0.0),
+                disk_busy: Some(4.0),
             }
         });
         assert!(run(&w).is_empty(), "{:?}", titles(&run(&w)));
@@ -949,6 +959,29 @@ mod tests {
             s.cpu_pct = 70.0;
             s.clock_mhz = 0;
         });
+        assert!(run(&w).is_empty());
+    }
+
+    #[test]
+    fn a_busy_slow_disk_is_heavy_even_at_low_throughput() {
+        // A modest disk (30 MB/s) pinned at 100% busy: Task Manager would show Disk 100%.
+        let w = window_i(|i, s| {
+            s.disk_bps = 30 << 20;
+            s.sensors.disk_busy = Some(if (10..40).contains(&i) { 100.0 } else { 3.0 });
+            if (10..40).contains(&i) {
+                s.procs.push(proc("copy.exe", 1, 3.0, 28, 0.1));
+            }
+        });
+        let f = run(&w);
+        assert_eq!(f.len(), 1, "{:?}", titles(&f));
+        assert_eq!(f[0].title, "Heavy disk activity");
+        assert!(f[0].evidence.iter().any(|e| e.contains("busy 100%")));
+        assert!(f[0].evidence.iter().any(|e| e.contains("copy.exe")));
+    }
+
+    #[test]
+    fn a_two_second_busy_blip_is_not_heavy_disk() {
+        let w = window_i(|i, s| s.sensors.disk_busy = Some(if (20..22).contains(&i) { 100.0 } else { 2.0 }));
         assert!(run(&w).is_empty());
     }
 

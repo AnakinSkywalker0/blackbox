@@ -39,6 +39,9 @@ pub struct Sensors {
     /// Memory pages written out to disk per second to free RAM. Near zero on a healthy
     /// machine, so a high value is real memory pressure (unlike a static swap size).
     pub page_out: Option<f32>,
+    /// Share of the time the disk was busy servicing requests, 0..100 (what Task Manager
+    /// shows as Disk %). Unlike throughput it means the same on a slow disk and a fast one.
+    pub disk_busy: Option<f32>,
 }
 
 pub const GPU_THERMAL: u8 = 1;

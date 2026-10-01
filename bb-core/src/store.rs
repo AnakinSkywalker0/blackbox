@@ -10,8 +10,8 @@ pub const THIN_STEP_SECS: i64 = 10;
 
 /// Nullable columns added in schema v1. NULL means the sensor was unavailable.
 /// Scaled integers keep rows small: temps, gpu and frequency x10, queue x100.
-const SENSOR_COLUMNS: [&str; 11] =
-    ["ac", "batt", "saver", "temp", "fpct", "gpu", "gtemp", "gthr", "dq", "dlat", "pgo"];
+const SENSOR_COLUMNS: [&str; 12] =
+    ["ac", "batt", "saver", "temp", "fpct", "gpu", "gtemp", "gthr", "dq", "dlat", "pgo", "dbusy"];
 
 fn scaled(v: Option<f32>, k: f32) -> Option<i64> {
     v.map(|x| (x * k).round() as i64)
@@ -121,7 +121,7 @@ impl Store {
     /// Adds sensor columns to databases created by older versions.
     fn migrate(conn: &Connection) -> rusqlite::Result<()> {
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-        if version < 2 {
+        if version < 3 {
             let have: Vec<String> = conn
                 .prepare("SELECT name FROM pragma_table_info('samples')")?
                 .query_map([], |r| r.get(0))?
@@ -131,7 +131,7 @@ impl Store {
                     conn.execute_batch(&format!("ALTER TABLE samples ADD COLUMN {col} INTEGER"))?;
                 }
             }
-            conn.execute_batch("PRAGMA user_version = 2")?;
+            conn.execute_batch("PRAGMA user_version = 3")?;
         }
         Ok(())
     }
@@ -154,8 +154,8 @@ impl Store {
         let x = &s.sensors;
         tx.execute(
             "INSERT OR REPLACE INTO samples
-             (ts,cpu,mem_used,mem_total,swap_used,mhz,disk,ac,batt,saver,temp,fpct,gpu,gtemp,gthr,dq,dlat,pgo)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18)",
+             (ts,cpu,mem_used,mem_total,swap_used,mhz,disk,ac,batt,saver,temp,fpct,gpu,gtemp,gthr,dq,dlat,pgo,dbusy)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19)",
             params![
                 s.ts,
                 (s.cpu_pct * 10.0).round() as i64,
@@ -175,6 +175,7 @@ impl Store {
                 scaled(x.disk_queue, 100.0),
                 scaled(x.disk_latency_ms, 10.0),
                 scaled(x.page_out, 1.0),
+                scaled(x.disk_busy, 10.0),
             ],
         )?;
         {
@@ -200,7 +201,7 @@ impl Store {
         const MIB: u64 = 1024 * 1024;
         let mut st = self.conn.prepare_cached(
             "SELECT ts,cpu,mem_used,mem_total,swap_used,mhz,disk,
-                    ac,batt,saver,temp,fpct,gpu,gtemp,gthr,dq,dlat,pgo FROM samples
+                    ac,batt,saver,temp,fpct,gpu,gtemp,gthr,dq,dlat,pgo,dbusy FROM samples
              WHERE ts BETWEEN ?1 AND ?2 ORDER BY ts",
         )?;
         let mut out: Vec<Sample> = st
@@ -225,6 +226,7 @@ impl Store {
                         disk_queue: unscaled(r.get(15)?, 100.0),
                         disk_latency_ms: unscaled(r.get(16)?, 10.0),
                         page_out: unscaled(r.get(17)?, 1.0),
+                        disk_busy: unscaled(r.get(18)?, 10.0),
                     },
                     procs: Vec::new(),
                 })
@@ -371,6 +373,7 @@ mod tests {
                 disk_queue: Some(1.25),
                 disk_latency_ms: Some(12.5),
                 page_out: Some(1200.0),
+                disk_busy: Some(87.5),
             },
             procs: vec![ProcRow {
                 name: "chrome.exe".into(),
@@ -425,6 +428,32 @@ mod tests {
         // Programs are thinned along with their samples.
         let old = s.window(now - 2 * 86400, now - 2 * 86400 + 100).unwrap();
         assert!(old.iter().all(|x| x.procs.len() == 1));
+    }
+
+    #[test]
+    fn upgrades_a_v2_database_by_adding_only_the_missing_column() {
+        let path = std::env::temp_dir().join(format!("bb-migrate-v2-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        {
+            let c = Connection::open(&path).unwrap();
+            c.execute_batch(
+                "CREATE TABLE samples (ts INTEGER PRIMARY KEY, cpu INTEGER NOT NULL, mem_used INTEGER NOT NULL,
+                    mem_total INTEGER NOT NULL, swap_used INTEGER NOT NULL, mhz INTEGER NOT NULL, disk INTEGER NOT NULL,
+                    ac INTEGER, batt INTEGER, saver INTEGER, temp INTEGER, fpct INTEGER, gpu INTEGER, gtemp INTEGER,
+                    gthr INTEGER, dq INTEGER, dlat INTEGER, pgo INTEGER);
+                 INSERT INTO samples (ts,cpu,mem_used,mem_total,swap_used,mhz,disk,pgo) VALUES (7, 100, 1, 2, 0, 3000, 0, 55);
+                 PRAGMA user_version = 2;",
+            )
+            .unwrap();
+        }
+        let st = Store::open(&path).unwrap();
+        let w = st.window(7, 7).unwrap().remove(0);
+        assert_eq!(w.sensors.page_out, Some(55.0));
+        assert_eq!(w.sensors.disk_busy, None);
+        drop(st);
+        for ext in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{ext}", path.display()));
+        }
     }
 
     #[test]

@@ -11,6 +11,8 @@ pub struct SensorReader {
     win: win::Win,
     #[cfg(target_os = "linux")]
     swap_out: SwapRate,
+    #[cfg(target_os = "linux")]
+    disk_busy: DiskBusy,
     nvml: Option<nvml_wrapper::Nvml>,
 }
 
@@ -27,6 +29,8 @@ impl SensorReader {
             win: win::Win::new(),
             #[cfg(target_os = "linux")]
             swap_out: SwapRate::default(),
+            #[cfg(target_os = "linux")]
+            disk_busy: DiskBusy::default(),
             // Loads nvml.dll / libnvidia-ml.so at runtime; absent on non-NVIDIA machines.
             nvml: nvml_wrapper::Nvml::init().ok(),
         }
@@ -43,6 +47,7 @@ impl SensorReader {
             read_battery_sysfs(Path::new("/sys/class/power_supply"), &mut s);
             s.temp_c = read_thermal_sysfs(Path::new("/sys/class/thermal"));
             s.page_out = self.swap_out.read();
+            s.disk_busy = self.disk_busy.read();
         }
         if let Some(nvml) = &self.nvml {
             read_nvml(nvml, &mut s);
@@ -77,6 +82,51 @@ fn read_nvml(nvml: &nvml_wrapper::Nvml, s: &mut Sensors) {
 }
 
 // ---- Linux (std only, testable anywhere) -----------------------------------------
+
+/// Milliseconds each whole disk has spent busy, from the text of `/proc/diskstats`.
+/// Partitions are skipped so the same I/O isn't counted twice.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) fn parse_io_ticks(text: &str) -> Vec<(String, u64)> {
+    let whole_disk = |n: &str| {
+        let digits_end = n.trim_end_matches(|c: char| c.is_ascii_digit());
+        // sda, vda, xvda, hda; nvme0n1; mmcblk0. Their partitions end in a number (sda1, nvme0n1p1).
+        (n.starts_with("sd") || n.starts_with("vd") || n.starts_with("xvd") || n.starts_with("hd")) && digits_end.len() == n.len()
+            || (n.starts_with("nvme") && !n.contains('p') )
+            || (n.starts_with("mmcblk") && !n.contains('p'))
+    };
+    text.lines()
+        .filter_map(|l| {
+            let f: Vec<&str> = l.split_whitespace().collect();
+            // major minor name, then 11+ counters; io_ticks is the 10th counter (index 12).
+            let (name, ticks) = (f.get(2)?, f.get(12)?.parse::<u64>().ok()?);
+            whole_disk(name).then(|| (name.to_string(), ticks))
+        })
+        .collect()
+}
+
+/// Turns the busy-milliseconds counters into the busiest disk's percent busy.
+#[cfg(target_os = "linux")]
+#[derive(Default)]
+struct DiskBusy {
+    last: Option<(std::time::Instant, Vec<(String, u64)>)>,
+}
+
+#[cfg(target_os = "linux")]
+impl DiskBusy {
+    fn read(&mut self) -> Option<f32> {
+        let now_ticks = parse_io_ticks(&std::fs::read_to_string("/proc/diskstats").ok()?);
+        let now = std::time::Instant::now();
+        let busy = self.last.as_ref().and_then(|(t, prev)| {
+            let ms = now.duration_since(*t).as_secs_f32().max(0.05) * 1000.0;
+            now_ticks
+                .iter()
+                .filter_map(|(n, v)| prev.iter().find(|(pn, _)| pn == n).map(|(_, pv)| (v.saturating_sub(*pv) as f32 / ms * 100.0).min(100.0)))
+                .fold(None, |m: Option<f32>, b| Some(m.map_or(b, |m| m.max(b))))
+        });
+        self.last = Some((now, now_ticks));
+        busy
+    }
+}
 
 /// Pages swapped out since boot, from the text of `/proc/vmstat`.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
@@ -284,6 +334,7 @@ mod win {
         temp_hp: Option<PDH_HCOUNTER>,
         temp: Option<PDH_HCOUNTER>,
         page_out: Option<PDH_HCOUNTER>,
+        disk_idle: Option<PDH_HCOUNTER>,
         gpu: Option<GpuProbe>,
         gpu_next: Option<GpuProbe>,
         ticks: u64,
@@ -302,6 +353,7 @@ mod win {
                 temp_hp: add(r"\Thermal Zone Information(*)\High Precision Temperature"),
                 temp: add(r"\Thermal Zone Information(*)\Temperature"),
                 page_out: add(r"\Memory\Pages Output/sec"),
+                disk_idle: add(r"\PhysicalDisk(_Total)\% Idle Time"),
                 gpu: GpuProbe::new(),
                 gpu_next: None,
                 ticks: 0,
@@ -323,6 +375,7 @@ mod win {
                     s.disk_latency_ms = self.latency.and_then(value).map(|v| (v * 1000.0) as f32);
                     s.freq_pct = self.freq.and_then(value).map(|v| v as f32);
                     s.page_out = self.page_out.and_then(value).map(|v| v as f32);
+                    s.disk_busy = self.disk_idle.and_then(value).map(|v| (100.0 - v as f32).clamp(0.0, 100.0));
                     let zones = self
                         .temp_hp
                         .map(array)
@@ -430,6 +483,24 @@ mod tests {
         read_battery_sysfs(Path::new("/definitely/not/here"), &mut s);
         assert_eq!(s, Sensors::default());
         assert_eq!(read_thermal_sysfs(Path::new("/definitely/not/here")), None);
+    }
+
+    #[test]
+    fn reads_disk_busy_time_for_whole_disks_only() {
+        let diskstats = "\
+   8       0 sda 100 0 800 50 200 0 1600 70 0 4000 120 0 0 0 0
+   8       1 sda1 90 0 700 40 190 0 1500 60 0 3900 100 0 0 0 0
+ 259       0 nvme0n1 10 0 80 5 20 0 160 7 0 1234 12 0 0 0 0
+ 259       1 nvme0n1p1 9 0 70 4 19 0 150 6 0 1200 10 0 0 0 0
+   7       0 loop0 1 0 2 0 0 0 0 0 0 5 0 0 0 0 0
+ 252       0 vda 1 0 2 0 0 0 0 0 0 777 0 0 0 0 0
+";
+        let got = parse_io_ticks(diskstats);
+        let names: Vec<&str> = got.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, ["sda", "nvme0n1", "vda"]);
+        assert_eq!(got[0].1, 4000);
+        assert_eq!(got[1].1, 1234);
+        assert!(parse_io_ticks("").is_empty());
     }
 
     #[test]

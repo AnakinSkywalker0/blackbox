@@ -175,6 +175,8 @@ $ bb sensors
   GPU throttling   none
   Disk latency     0.2 ms per request
   Disk queue       0.01 requests waiting
+  Disk busy        3% of the time
+  Memory paging    0 pages/s written out (0.0 MB/s)
 ```
 
 ### `bb update`
@@ -271,7 +273,7 @@ Each finding has a title, evidence, a confidence label (high / medium / low) and
 | **GPU throttled** | GPU 50%+ busy and the driver reports a **heat**, **power cap** or hardware slowdown for half the window | NVIDIA only (needs the driver's NVML). Says whether it was heat or the power budget, and notes if you were on battery. |
 | **GPU maxed out / very hot** | GPU load **90%+**, or GPU temperature **85 C+** | GPU load works on any GPU vendor on Windows. |
 | **Short memory squeeze** | Memory **90%+** full for 10 seconds **with measured paging** while the whole window looked fine | Names the largest memory user then. Needs paging to be measured, so a machine that just sits nearly full without harm is not blamed. |
-| **Heavy disk activity** | Total disk throughput **80 MB/s+** | Names the program doing most of the I/O. |
+| **Heavy disk activity** | Total disk throughput **80 MB/s+**, **or** the disk busy **90%+** of the time for 5 seconds (what Task Manager shows as Disk %) | Names the program doing most of the I/O. The busy-time test means the same on a slow disk and a fast one, so a modest drive that is pinned still counts. |
 | **Slow disk** | Disk requests averaged **50 ms+** (counting only seconds with disk use), or **4+** requests waiting | Catches a slow or failing disk that moves little data. Names the busiest program. |
 | **Short CPU spike** | CPU averaged **95%+** for **5 consecutive seconds** while the whole window looked fine | Names the busiest program then, and the exact time to zoom in on. |
 | **Brief disk stall** | A single disk request time of **300 ms+** that the average hides | Gives the time and the program doing the most I/O. |

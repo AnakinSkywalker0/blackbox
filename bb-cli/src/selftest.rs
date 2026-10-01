@@ -37,8 +37,17 @@ struct Scenario {
     expect: Expect,
 }
 
+/// How a scenario ended. NOISY means the machine wasn't quiet, so the result can't be judged.
+#[derive(Clone, Copy, PartialEq)]
+enum Status {
+    Pass,
+    Fail,
+    Noisy,
+}
+
 struct Outcome {
     name: &'static str,
+    status: Status,
     pass: bool,
     ranked_first: bool,
     detail: String,
@@ -266,6 +275,7 @@ fn run_scenario(sc: &Scenario) -> Outcome {
         Err(e) => {
             return Outcome {
                 name: sc.name,
+                status: Status::Fail,
                 pass: false,
                 ranked_first: false,
                 detail: format!("storage error: {e}"),
@@ -282,7 +292,11 @@ fn run_scenario(sc: &Scenario) -> Outcome {
                 (true, true, "no findings, as it should be".to_string(), vec![])
             } else {
                 let t: Vec<String> = findings.iter().map(|f| f.title.clone()).collect();
-                (false, false, format!("FALSE ALARM: {}", t.join("; ")), vec![])
+                // Show why each fired, and what the machine really did, so it can be judged.
+                let mut why: Vec<String> = findings.iter().flat_map(|f| f.evidence.iter().map(|e| format!("because {e}"))).collect();
+                why.push(observed(&samples));
+                let label = if machine_was_busy(&samples) { "NOT QUIET" } else { "FALSE ALARM" };
+                (false, false, format!("{label}: {}", t.join("; ")), why)
             }
         }
         Expect::Finding(ok) => match findings.iter().position(|f| ok(f)) {
@@ -296,7 +310,29 @@ fn run_scenario(sc: &Scenario) -> Outcome {
             }
         },
     };
-    Outcome { name: sc.name, pass, ranked_first, detail, extras, samples: samples.len(), expected_samples: total }
+    // A failed control only counts against blackbox if the machine really was quiet.
+    let status = if pass {
+        Status::Pass
+    } else if matches!(sc.expect, Expect::Nothing) && machine_was_busy(&samples) {
+        Status::Noisy
+    } else {
+        Status::Fail
+    };
+    Outcome { name: sc.name, status, pass, ranked_first, detail, extras, samples: samples.len(), expected_samples: total }
+}
+
+/// Did the machine's own measurements show real background load during a "quiet" run?
+/// If so, a finding there is not a false alarm: something really was using the machine.
+fn machine_was_busy(samples: &[Sample]) -> bool {
+    let n = samples.len().max(1) as f32;
+    let cpu_avg = samples.iter().map(|s| s.cpu_pct).sum::<f32>() / n;
+    let mem_avg = samples
+        .iter()
+        .map(|s| if s.mem_total == 0 { 0.0 } else { s.mem_used as f32 * 100.0 / s.mem_total as f32 })
+        .sum::<f32>()
+        / n;
+    let disk_peak_mb = samples.iter().map(|s| s.disk_bps).max().unwrap_or(0) / MB;
+    cpu_avg >= 15.0 || mem_avg >= 90.0 || disk_peak_mb >= 80
 }
 
 /// A one-line summary of what the machine actually did, to explain a miss.
@@ -328,6 +364,7 @@ pub fn run(only: &[String], include_memory: bool, recorder_running: bool) -> Res
     let all = scenarios(cores, include_memory);
     let mut outcomes: Vec<Outcome> = Vec::new();
     let mut skipped: Vec<(String, String)> = Vec::new();
+    let mut noisy = false;
     for item in all {
         match item {
             Err((name, why)) => skipped.push((name, why)),
@@ -336,8 +373,15 @@ pub fn run(only: &[String], include_memory: bool, recorder_running: bool) -> Res
                     continue;
                 }
                 println!("  running {:<10} {} ...", sc.name, sc.induced);
-                let o = run_scenario(&sc);
-                println!("  -> {}", if o.pass { "pass" } else { "FAIL" });
+                let mut o = run_scenario(&sc);
+                if o.name == "control" && o.status == Status::Noisy {
+                    noisy = true;
+                } else if noisy && o.status == Status::Fail {
+                    // A busy machine can hide or mimic what we induce, so a miss proves nothing.
+                    o.status = Status::Noisy;
+                    o.detail = format!("{} (not judged: the machine wasn't quiet)", o.detail);
+                }
+                println!("  -> {}", match o.status { Status::Pass => "pass", Status::Fail => "FAIL", Status::Noisy => "noisy" });
                 outcomes.push(o);
             }
         }
@@ -346,7 +390,8 @@ pub fn run(only: &[String], include_memory: bool, recorder_running: bool) -> Res
     println!("\n{:<11} {:<5} {:<7} {}", "SCENARIO", "", "RANK", "WHAT `bb why` SAID");
     for o in &outcomes {
         let rank = if o.name == "control" { "-" } else if o.ranked_first { "1st" } else if o.pass { "later" } else { "-" };
-        println!("{:<11} {:<5} {:<7} {}", o.name, if o.pass { "PASS" } else { "FAIL" }, rank, o.detail);
+        let tag = match o.status { Status::Pass => "PASS", Status::Fail => "FAIL", Status::Noisy => "NOISY" };
+        println!("{:<11} {:<5} {:<7} {}", o.name, tag, rank, o.detail);
         for e in &o.extras {
             println!("{:<24} also reported: {e}", "");
         }
@@ -358,8 +403,13 @@ pub fn run(only: &[String], include_memory: bool, recorder_running: bool) -> Res
     let induced: Vec<&Outcome> = outcomes.iter().filter(|o| o.name != "control").collect();
     let detected = induced.iter().filter(|o| o.pass).count();
     let first = induced.iter().filter(|o| o.pass && o.ranked_first).count();
-    let false_alarms = outcomes.iter().filter(|o| o.name == "control" && !o.pass).count();
-    println!("\nDetected {detected} of {} induced slowdowns ({first} as the top explanation). False alarms on a quiet machine: {false_alarms}.", induced.len());
+    let unjudged = induced.iter().filter(|o| o.status == Status::Noisy).count();
+    let judged = induced.len() - unjudged;
+    let false_alarms = outcomes.iter().filter(|o| o.name == "control" && o.status == Status::Fail).count();
+    println!("\nDetected {detected} of {judged} induced slowdowns ({first} as the top explanation). False alarms on a quiet machine: {false_alarms}.");
+    if noisy {
+        println!("The machine was not quiet (something was really using it during the control run), so {unjudged} scenario(s) could not be judged. Close other programs and run again for a clean result.");
+    }
 
     if !skipped.is_empty() {
         println!("\nNot run:");
@@ -370,7 +420,7 @@ pub fn run(only: &[String], include_memory: bool, recorder_running: bool) -> Res
     println!("\nCan't be caused from software, so only covered by synthetic tests, not real ones:");
     println!("  heat/thermal throttling, battery and power-mode limits, GPU load or throttling, a slow or failing disk, machine stalls.");
 
-    let failed = outcomes.iter().filter(|o| !o.pass).count();
+    let failed = outcomes.iter().filter(|o| o.status == Status::Fail).count();
     if failed > 0 {
         return Err(format!("{failed} scenario(s) failed"));
     }

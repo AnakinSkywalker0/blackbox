@@ -32,7 +32,9 @@ and it answers in plain English with evidence.
 
 ## Install
 
-You build it from source. No admin rights are needed to build or run.
+**Prebuilt (Windows):** download the zip from the [Releases page](../../releases), unzip it, and run `bb.exe install`. That is all. No Rust needed. Each release also ships a Linux build and `.sha256` checksums.
+
+**Or build it from source.** No admin rights are needed to build or run.
 
 **1. Install Rust** from <https://rustup.rs>.
 

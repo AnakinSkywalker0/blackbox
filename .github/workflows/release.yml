@@ -1,0 +1,110 @@
+name: Release
+
+# Push a version tag (for example v0.2.0) to build and publish a release.
+# "Run workflow" from the Actions tab does a dry run: it builds and uploads the
+# files as workflow artifacts, but publishes nothing.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: build (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - name: windows-x86_64
+            os: windows-latest
+            exe: bb.exe
+          - name: linux-x86_64
+            os: ubuntu-latest
+            exe: bb
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Check the tag matches the crate version
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          version=$(grep -m1 '^version' bb-cli/Cargo.toml | cut -d'"' -f2)
+          if [ "v$version" != "${GITHUB_REF_NAME}" ]; then
+            echo "Tag ${GITHUB_REF_NAME} does not match bb-cli/Cargo.toml version v$version"
+            exit 1
+          fi
+
+      - name: Tests
+        run: cargo test --workspace --locked
+
+      - name: Build
+        run: cargo build --release --locked -p bb-cli
+
+      - name: Package
+        id: pack
+        run: |
+          version=$(grep -m1 '^version' bb-cli/Cargo.toml | cut -d'"' -f2)
+          dir="bb-v${version}-${{ matrix.name }}"
+          mkdir "$dir"
+          cp "target/release/${{ matrix.exe }}" README.md LICENSE "$dir/"
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            asset="$dir.zip"
+            7z a -tzip "$asset" "$dir" > /dev/null
+          else
+            asset="$dir.tar.gz"
+            tar czf "$asset" "$dir"
+          fi
+          if command -v sha256sum > /dev/null; then sha256sum "$asset" > "$asset.sha256"; else shasum -a 256 "$asset" > "$asset.sha256"; fi
+          echo "asset=$asset" >> "$GITHUB_OUTPUT"
+
+      - name: Smoke test the packaged binary
+        run: |
+          dir="bb-v$(grep -m1 '^version' bb-cli/Cargo.toml | cut -d'"' -f2)-${{ matrix.name }}"
+          "./$dir/${{ matrix.exe }}" --version
+          "./$dir/${{ matrix.exe }}" bench --secs 3
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}
+          path: |
+            ${{ steps.pack.outputs.asset }}
+            ${{ steps.pack.outputs.asset }}.sha256
+          if-no-files-found: error
+
+  publish:
+    name: publish release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: List files
+        run: ls -l dist
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
+          body: |
+            ## Install (Windows)
+
+            1. Download the `windows-x86_64` zip below and unzip it.
+            2. Run `bb.exe install` in that folder.
+            3. Open a new terminal and run `bb status`.
+
+            `bb install` copies bb onto your PATH, starts recording in the background and starts it at every login. `bb uninstall` reverses it. Check the download against its `.sha256` file if you like.

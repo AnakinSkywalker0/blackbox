@@ -4,6 +4,7 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -18,7 +19,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [windows-latest, ubuntu-latest]
+        os: [windows-latest, ubuntu-latest, macos-latest]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -27,3 +28,30 @@ jobs:
         run: cargo test --workspace --locked
       - name: Release build
         run: cargo build --release --locked
+
+      # Install, run, and uninstall for real (in a throwaway HOME) on Linux and macOS.
+      - name: Install and uninstall smoke test
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          export HOME="$RUNNER_TEMP/home"; mkdir -p "$HOME"
+          db="$HOME/bb.db"
+          ./target/release/bb --db "$db" install
+          bin="$HOME/.local/bin/bb"
+          test -x "$bin" || { echo "bb wasn't installed"; exit 1; }
+          "$bin" --version
+          sleep 3
+          "$bin" --db "$db" status
+          if [ "$(uname -s)" = "Darwin" ]; then agent="$HOME/Library/LaunchAgents/io.github.anakinskywalker0.blackbox.plist"; else agent="$HOME/.config/autostart/blackbox.desktop"; fi
+          test -f "$agent" || { echo "no autostart entry at $agent"; exit 1; }
+          cat "$agent"
+          "$bin" --db "$db" uninstall --purge
+          test ! -e "$bin" || { echo "bb wasn't removed"; exit 1; }
+          test ! -e "$agent" || { echo "autostart entry wasn't removed"; exit 1; }
+
+      # Cause real slowdowns and check bb why names them. Not blocking yet: shared CI
+      # machines are noisy, so for now this is evidence, not a gate.
+      - name: Selftest (real induced slowdowns)
+        continue-on-error: true
+        shell: bash
+        run: ./target/release/bb selftest --only control,cpu_hog,cpu_spike,disk_heavy

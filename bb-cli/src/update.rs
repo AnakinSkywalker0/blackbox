@@ -18,7 +18,20 @@ const CURRENT: &str = env!("CARGO_PKG_VERSION");
 const MAX_BYTES: u64 = 64 * 1024 * 1024;
 
 /// The release asset suffix for this platform, if `bb update` can install it.
-const PLATFORM: Option<&str> = if cfg!(all(windows, target_arch = "x86_64")) { Some("windows-x86_64") } else { None };
+const PLATFORM: Option<&str> = if cfg!(all(windows, target_arch = "x86_64")) {
+    Some("windows-x86_64")
+} else if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+    Some("linux-x86_64")
+} else if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+    Some("macos-arm64")
+} else if cfg!(all(target_os = "macos", target_arch = "x86_64")) {
+    Some("macos-x86_64")
+} else {
+    None
+};
+
+/// Windows releases are zips containing bb.exe; the others are tarballs containing bb.
+const ARCHIVE_EXT: &str = if cfg!(windows) { "zip" } else { "tar.gz" };
 
 #[derive(Debug, Deserialize)]
 struct Release {
@@ -51,7 +64,11 @@ pub fn is_newer(candidate: &str, current: &str) -> bool {
 
 /// The zip and checksum assets for `version` on `platform`, as (zip url, checksum url, zip name).
 fn find_assets<'a>(rel: &'a Release, version: &str, platform: &str) -> Option<(&'a str, &'a str, &'a str)> {
-    let zip_name = format!("bb-v{version}-{platform}.zip");
+    find_assets_as(rel, version, platform, ARCHIVE_EXT)
+}
+
+fn find_assets_as<'a>(rel: &'a Release, version: &str, platform: &str, ext: &str) -> Option<(&'a str, &'a str, &'a str)> {
+    let zip_name = format!("bb-v{version}-{platform}.{ext}");
     let sha_name = format!("{zip_name}.sha256");
     let find = |n: &str| rel.assets.iter().find(|a| a.name == n);
     Some((&find(&zip_name)?.browser_download_url, &find(&sha_name)?.browser_download_url, &find(&zip_name)?.name))
@@ -80,6 +97,26 @@ fn extract_exe(zip_bytes: &[u8]) -> Result<Vec<u8>, String> {
         }
     }
     Err("bb.exe wasn't found inside the download".into())
+}
+
+/// Finds the `bb` program inside a release tarball and returns its bytes.
+fn extract_tar_bb(tar_gz: &[u8]) -> Result<Vec<u8>, String> {
+    let mut archive = tar::Archive::new(flate2::read::GzDecoder::new(Cursor::new(tar_gz)));
+    for entry in archive.entries().map_err(|e| format!("the download isn't a valid tarball: {e}"))? {
+        let entry = entry.map_err(|e| e.to_string())?;
+        let is_bb = entry.path().ok().and_then(|p| p.file_name().map(|n| n == "bb")).unwrap_or(false);
+        if is_bb && entry.header().entry_type().is_file() {
+            let mut out = Vec::new();
+            entry.take(MAX_BYTES).read_to_end(&mut out).map_err(|e| e.to_string())?;
+            return Ok(out);
+        }
+    }
+    Err("bb wasn't found inside the download".into())
+}
+
+/// Unpacks the release archive for this platform and returns the program's bytes.
+fn extract_program(archive: &[u8]) -> Result<Vec<u8>, String> {
+    if cfg!(windows) { extract_exe(archive) } else { extract_tar_bb(archive) }
 }
 
 // ---- network ---------------------------------------------------------------------
@@ -157,7 +194,7 @@ pub fn run(db: &Path, check_only: bool) -> Res {
         return Err(format!("checksum mismatch, so nothing was installed.\n  expected {expected}\n  got      {actual}"));
     }
     println!("Checksum OK ({} KB).", zip_bytes.len() / 1024);
-    let exe_bytes = extract_exe(&zip_bytes)?;
+    let exe_bytes = extract_program(&zip_bytes)?;
     install_new(db, &exe_bytes, &latest)
 }
 
@@ -169,6 +206,11 @@ fn install_new(db: &Path, exe_bytes: &[u8], version: &str) -> Res {
     let staged = dir.join(if cfg!(windows) { "bb.exe" } else { "bb" });
     let result = (|| {
         std::fs::write(&staged, exe_bytes).map_err(|e| format!("can't stage the update: {e}"))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o755)).map_err(|e| e.to_string())?;
+        }
         let out = std::process::Command::new(&staged).arg("--version").output().map_err(|e| format!("the downloaded program won't run: {e}"))?;
         let said = String::from_utf8_lossy(&out.stdout).trim().to_string();
         if said != format!("bb {version}") {
@@ -218,13 +260,46 @@ fn replace_self(db: &Path, staged: &Path, version: &str) -> Res {
     Ok(())
 }
 
-#[cfg(not(windows))]
+#[cfg(unix)]
+fn replace_self(db: &Path, staged: &Path, version: &str) -> Res {
+    use std::process::Command;
+    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    let was_recording = crate::install::running_pid(db).is_some();
+    if was_recording {
+        crate::install::stop(db, true)?;
+    }
+    let restart = |why: &str| {
+        if was_recording {
+            let _ = Command::new(&exe).arg("--db").arg(db).arg("start").arg("--quiet").status();
+        }
+        why.to_string()
+    };
+    // Copy next to the target, then rename over it. A rename is atomic and works while the
+    // old program is running, so there is never a half-written bb.
+    let beside = exe.with_file_name("bb.update");
+    if let Err(e) = std::fs::copy(staged, &beside) {
+        return Err(restart(&format!("can't write to {}: {e}. Is it in a folder you can write to?", exe.parent().map_or(".".into(), |p| p.display().to_string()))));
+    }
+    if let Err(e) = std::fs::rename(&beside, &exe) {
+        let _ = std::fs::remove_file(&beside);
+        return Err(restart(&format!("can't replace {}: {e}", exe.display())));
+    }
+    println!("Updated {} to {version}.", exe.display());
+    if was_recording {
+        let ok = Command::new(&exe).arg("--db").arg(db).arg("start").arg("--quiet").status().map(|s| s.success()).unwrap_or(false);
+        println!("{}", if ok { "Recording restarted." } else { "Couldn't restart recording. Run `bb start`." });
+    }
+    Ok(())
+}
+
+#[cfg(not(any(windows, unix)))]
 fn replace_self(_db: &Path, _staged: &Path, _version: &str) -> Res {
     Err("automatic install isn't supported on this platform yet".into())
 }
 
 /// Removes the previous version left behind by an update, once nothing is running it.
 pub fn clean_up_old_version() {
+    #[cfg(windows)]
     if let Ok(exe) = std::env::current_exe() {
         let _ = std::fs::remove_file(exe.with_file_name("bb.exe.old"));
     }
@@ -318,6 +393,51 @@ mod tests {
     fn extracts_the_exe_from_the_release_folder() {
         let z = make_zip(&[("bb-v0.3.0-windows-x86_64/README.md", b"hi"), ("bb-v0.3.0-windows-x86_64/bb.exe", b"MZ-binary")]);
         assert_eq!(extract_exe(&z).unwrap(), b"MZ-binary");
+    }
+
+    fn make_tar_gz(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        {
+            let mut b = tar::Builder::new(&mut gz);
+            for (name, data) in entries {
+                let mut h = tar::Header::new_gnu();
+                h.set_size(data.len() as u64);
+                h.set_mode(0o755);
+                h.set_cksum();
+                b.append_data(&mut h, name, *data).unwrap();
+            }
+            b.finish().unwrap();
+        }
+        gz.finish().unwrap()
+    }
+
+    #[test]
+    fn extracts_bb_from_a_release_tarball() {
+        let t = make_tar_gz(&[("bb-v0.4.0-linux-x86_64/README.md", b"hi"), ("bb-v0.4.0-linux-x86_64/bb", b"\x7fELF-binary")]);
+        assert_eq!(extract_tar_bb(&t).unwrap(), b"\x7fELF-binary");
+    }
+
+    #[test]
+    fn tarball_without_bb_or_garbage_is_rejected() {
+        assert!(extract_tar_bb(&make_tar_gz(&[("README.md", b"x"), ("bb-v1/bb.txt", b"x")])).is_err());
+        assert!(extract_tar_bb(b"not gzip").is_err());
+    }
+
+    #[test]
+    fn tarball_assets_are_found_for_unix_platforms() {
+        let asset = |n: &str| Asset { name: n.into(), browser_download_url: format!("https://x/{n}") };
+        let rel = Release {
+            tag_name: "v0.4.0".into(),
+            assets: vec![
+                asset("bb-v0.4.0-macos-arm64.tar.gz"),
+                asset("bb-v0.4.0-macos-arm64.tar.gz.sha256"),
+                asset("bb-v0.4.0-linux-x86_64.tar.gz"),
+            ],
+        };
+        let (url, sha, name) = find_assets_as(&rel, "0.4.0", "macos-arm64", "tar.gz").unwrap();
+        assert!(url.ends_with(".tar.gz") && sha.ends_with(".sha256") && name == "bb-v0.4.0-macos-arm64.tar.gz");
+        // Linux has no checksum asset in this fake release, so it must be refused.
+        assert!(find_assets_as(&rel, "0.4.0", "linux-x86_64", "tar.gz").is_none());
     }
 
     #[test]

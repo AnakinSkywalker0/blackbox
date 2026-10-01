@@ -10,8 +10,8 @@ pub const THIN_STEP_SECS: i64 = 10;
 
 /// Nullable columns added in schema v1. NULL means the sensor was unavailable.
 /// Scaled integers keep rows small: temps, gpu and frequency x10, queue x100.
-const SENSOR_COLUMNS: [&str; 10] =
-    ["ac", "batt", "saver", "temp", "fpct", "gpu", "gtemp", "gthr", "dq", "dlat"];
+const SENSOR_COLUMNS: [&str; 11] =
+    ["ac", "batt", "saver", "temp", "fpct", "gpu", "gtemp", "gthr", "dq", "dlat", "pgo"];
 
 fn scaled(v: Option<f32>, k: f32) -> Option<i64> {
     v.map(|x| (x * k).round() as i64)
@@ -19,6 +19,20 @@ fn scaled(v: Option<f32>, k: f32) -> Option<i64> {
 
 fn unscaled(v: Option<i64>, k: f32) -> Option<f32> {
     v.map(|x| x as f32 / k)
+}
+
+/// One recorded `bb why` answer and, once the user gives it, the verdict on it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct WhyLog {
+    pub id: i64,
+    pub ts: i64,
+    pub from_ts: i64,
+    pub to_ts: i64,
+    /// Finding titles, best first. Empty means "no clear cause".
+    pub titles: Vec<String>,
+    pub version: String,
+    pub verdict: Option<String>,
+    pub note: Option<String>,
 }
 
 pub struct Store {
@@ -87,7 +101,18 @@ impl Store {
                  disk INTEGER NOT NULL,     -- KiB/s
                  mem INTEGER NOT NULL,      -- MiB
                  PRIMARY KEY (ts, name)
-             ) WITHOUT ROWID;",
+             ) WITHOUT ROWID;
+             -- Every `bb why` result, so the user can say whether it was right.
+             CREATE TABLE IF NOT EXISTS why_log (
+                 id INTEGER PRIMARY KEY,
+                 ts INTEGER NOT NULL,
+                 from_ts INTEGER NOT NULL,
+                 to_ts INTEGER NOT NULL,
+                 titles TEXT NOT NULL,   -- one finding title per line, best first
+                 version TEXT NOT NULL,
+                 verdict TEXT,           -- right | partly | wrong
+                 note TEXT
+             );",
         )?;
         Self::migrate(&conn)?;
         Ok(Store { conn })
@@ -96,7 +121,7 @@ impl Store {
     /// Adds sensor columns to databases created by older versions.
     fn migrate(conn: &Connection) -> rusqlite::Result<()> {
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-        if version < 1 {
+        if version < 2 {
             let have: Vec<String> = conn
                 .prepare("SELECT name FROM pragma_table_info('samples')")?
                 .query_map([], |r| r.get(0))?
@@ -106,7 +131,7 @@ impl Store {
                     conn.execute_batch(&format!("ALTER TABLE samples ADD COLUMN {col} INTEGER"))?;
                 }
             }
-            conn.execute_batch("PRAGMA user_version = 1")?;
+            conn.execute_batch("PRAGMA user_version = 2")?;
         }
         Ok(())
     }
@@ -129,8 +154,8 @@ impl Store {
         let x = &s.sensors;
         tx.execute(
             "INSERT OR REPLACE INTO samples
-             (ts,cpu,mem_used,mem_total,swap_used,mhz,disk,ac,batt,saver,temp,fpct,gpu,gtemp,gthr,dq,dlat)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)",
+             (ts,cpu,mem_used,mem_total,swap_used,mhz,disk,ac,batt,saver,temp,fpct,gpu,gtemp,gthr,dq,dlat,pgo)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18)",
             params![
                 s.ts,
                 (s.cpu_pct * 10.0).round() as i64,
@@ -149,6 +174,7 @@ impl Store {
                 x.gpu_throttle.map(i64::from),
                 scaled(x.disk_queue, 100.0),
                 scaled(x.disk_latency_ms, 10.0),
+                scaled(x.page_out, 1.0),
             ],
         )?;
         {
@@ -174,7 +200,7 @@ impl Store {
         const MIB: u64 = 1024 * 1024;
         let mut st = self.conn.prepare_cached(
             "SELECT ts,cpu,mem_used,mem_total,swap_used,mhz,disk,
-                    ac,batt,saver,temp,fpct,gpu,gtemp,gthr,dq,dlat FROM samples
+                    ac,batt,saver,temp,fpct,gpu,gtemp,gthr,dq,dlat,pgo FROM samples
              WHERE ts BETWEEN ?1 AND ?2 ORDER BY ts",
         )?;
         let mut out: Vec<Sample> = st
@@ -198,6 +224,7 @@ impl Store {
                         gpu_throttle: r.get::<_, Option<i64>>(14)?.map(|v| v as u8),
                         disk_queue: unscaled(r.get(15)?, 100.0),
                         disk_latency_ms: unscaled(r.get(16)?, 10.0),
+                        page_out: unscaled(r.get(17)?, 1.0),
                     },
                     procs: Vec::new(),
                 })
@@ -225,6 +252,40 @@ impl Store {
             }
         }
         Ok(out)
+    }
+
+    pub fn log_why(&self, ts: i64, from: i64, to: i64, titles: &[String], version: &str) -> rusqlite::Result<i64> {
+        self.conn.execute(
+            "INSERT INTO why_log (ts, from_ts, to_ts, titles, version) VALUES (?1,?2,?3,?4,?5)",
+            params![ts, from, to, titles.join("\n"), version],
+        )?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    /// Records a verdict on the most recent `bb why`. Returns it, or None if there is none.
+    pub fn set_verdict(&self, verdict: &str, note: Option<&str>) -> rusqlite::Result<Option<WhyLog>> {
+        let id: Option<i64> = self.conn.query_row("SELECT MAX(id) FROM why_log", [], |r| r.get(0))?;
+        let Some(id) = id else { return Ok(None) };
+        self.conn.execute("UPDATE why_log SET verdict=?1, note=?2 WHERE id=?3", params![verdict, note, id])?;
+        Ok(self.why_log()?.into_iter().find(|w| w.id == id))
+    }
+
+    pub fn why_log(&self) -> rusqlite::Result<Vec<WhyLog>> {
+        let mut st = self.conn.prepare("SELECT id,ts,from_ts,to_ts,titles,version,verdict,note FROM why_log ORDER BY id")?;
+        let rows = st.query_map([], |r| {
+            let titles: String = r.get(4)?;
+            Ok(WhyLog {
+                id: r.get(0)?,
+                ts: r.get(1)?,
+                from_ts: r.get(2)?,
+                to_ts: r.get(3)?,
+                titles: titles.lines().map(str::to_string).collect(),
+                version: r.get(5)?,
+                verdict: r.get(6)?,
+                note: r.get(7)?,
+            })
+        })?;
+        rows.collect()
     }
 
     /// Highest clock speed ever recorded, the baseline for throttling detection.
@@ -309,6 +370,7 @@ mod tests {
                 gpu_throttle: Some(3),
                 disk_queue: Some(1.25),
                 disk_latency_ms: Some(12.5),
+                page_out: Some(1200.0),
             },
             procs: vec![ProcRow {
                 name: "chrome.exe".into(),
@@ -363,6 +425,22 @@ mod tests {
         // Programs are thinned along with their samples.
         let old = s.window(now - 2 * 86400, now - 2 * 86400 + 100).unwrap();
         assert!(old.iter().all(|x| x.procs.len() == 1));
+    }
+
+    #[test]
+    fn why_log_roundtrip_and_verdict_goes_to_the_latest() {
+        let st = Store::open_in_memory().unwrap();
+        assert_eq!(st.set_verdict("right", None).unwrap(), None);
+        let a = st.log_why(100, 40, 100, &["A was slow".into(), "B too".into()], "0.4.0").unwrap();
+        let b = st.log_why(200, 140, 200, &[], "0.4.0").unwrap();
+        assert!(b > a);
+        let got = st.set_verdict("wrong", Some("it was the browser")).unwrap().unwrap();
+        assert_eq!((got.id, got.verdict.as_deref(), got.note.as_deref()), (b, Some("wrong"), Some("it was the browser")));
+        let all = st.why_log().unwrap();
+        assert_eq!(all.len(), 2);
+        assert_eq!(all[0].titles, vec!["A was slow".to_string(), "B too".to_string()]);
+        assert_eq!(all[0].verdict, None);
+        assert!(all[1].titles.is_empty());
     }
 
     #[test]

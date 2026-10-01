@@ -9,6 +9,8 @@ use std::path::Path;
 pub struct SensorReader {
     #[cfg(windows)]
     win: win::Win,
+    #[cfg(target_os = "linux")]
+    swap_out: SwapRate,
     nvml: Option<nvml_wrapper::Nvml>,
 }
 
@@ -23,6 +25,8 @@ impl SensorReader {
         SensorReader {
             #[cfg(windows)]
             win: win::Win::new(),
+            #[cfg(target_os = "linux")]
+            swap_out: SwapRate::default(),
             // Loads nvml.dll / libnvidia-ml.so at runtime; absent on non-NVIDIA machines.
             nvml: nvml_wrapper::Nvml::init().ok(),
         }
@@ -38,6 +42,7 @@ impl SensorReader {
         {
             read_battery_sysfs(Path::new("/sys/class/power_supply"), &mut s);
             s.temp_c = read_thermal_sysfs(Path::new("/sys/class/thermal"));
+            s.page_out = self.swap_out.read();
         }
         if let Some(nvml) = &self.nvml {
             read_nvml(nvml, &mut s);
@@ -72,6 +77,30 @@ fn read_nvml(nvml: &nvml_wrapper::Nvml, s: &mut Sensors) {
 }
 
 // ---- Linux (std only, testable anywhere) -----------------------------------------
+
+/// Pages swapped out since boot, from the text of `/proc/vmstat`.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) fn parse_pswpout(text: &str) -> Option<u64> {
+    text.lines().find_map(|l| l.strip_prefix("pswpout ")?.trim().parse().ok())
+}
+
+/// Turns the ever-growing swap-out counter into pages per second.
+#[cfg(target_os = "linux")]
+#[derive(Default)]
+struct SwapRate {
+    last: Option<(std::time::Instant, u64)>,
+}
+
+#[cfg(target_os = "linux")]
+impl SwapRate {
+    fn read(&mut self) -> Option<f32> {
+        let n = parse_pswpout(&std::fs::read_to_string("/proc/vmstat").ok()?)?;
+        let now = std::time::Instant::now();
+        let rate = self.last.map(|(t, prev)| n.saturating_sub(prev) as f32 / now.duration_since(t).as_secs_f32().max(0.05));
+        self.last = Some((now, n));
+        rate
+    }
+}
 
 /// Reads battery level and AC state from a `power_supply` directory.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
@@ -254,6 +283,7 @@ mod win {
         freq: Option<PDH_HCOUNTER>,
         temp_hp: Option<PDH_HCOUNTER>,
         temp: Option<PDH_HCOUNTER>,
+        page_out: Option<PDH_HCOUNTER>,
         gpu: Option<GpuProbe>,
         gpu_next: Option<GpuProbe>,
         ticks: u64,
@@ -271,6 +301,7 @@ mod win {
                 freq: add(r"\Processor Information(_Total)\% of Maximum Frequency"),
                 temp_hp: add(r"\Thermal Zone Information(*)\High Precision Temperature"),
                 temp: add(r"\Thermal Zone Information(*)\Temperature"),
+                page_out: add(r"\Memory\Pages Output/sec"),
                 gpu: GpuProbe::new(),
                 gpu_next: None,
                 ticks: 0,
@@ -291,6 +322,7 @@ mod win {
                     s.disk_queue = self.queue.and_then(value).map(|v| v as f32);
                     s.disk_latency_ms = self.latency.and_then(value).map(|v| (v * 1000.0) as f32);
                     s.freq_pct = self.freq.and_then(value).map(|v| v as f32);
+                    s.page_out = self.page_out.and_then(value).map(|v| v as f32);
                     let zones = self
                         .temp_hp
                         .map(array)
@@ -398,6 +430,14 @@ mod tests {
         read_battery_sysfs(Path::new("/definitely/not/here"), &mut s);
         assert_eq!(s, Sensors::default());
         assert_eq!(read_thermal_sysfs(Path::new("/definitely/not/here")), None);
+    }
+
+    #[test]
+    fn parses_swap_out_counter() {
+        let vmstat = "nr_free_pages 12345\npswpin 77\npswpout 4242\npgpgin 5\n";
+        assert_eq!(parse_pswpout(vmstat), Some(4242));
+        assert_eq!(parse_pswpout("pswpin 1\n"), None);
+        assert_eq!(parse_pswpout(""), None);
     }
 
     #[test]

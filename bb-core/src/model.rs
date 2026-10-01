@@ -36,6 +36,9 @@ pub struct Sensors {
     pub disk_queue: Option<f32>,
     /// Average time for a disk request to complete, in milliseconds.
     pub disk_latency_ms: Option<f32>,
+    /// Memory pages written out to disk per second to free RAM. Near zero on a healthy
+    /// machine, so a high value is real memory pressure (unlike a static swap size).
+    pub page_out: Option<f32>,
 }
 
 pub const GPU_THERMAL: u8 = 1;

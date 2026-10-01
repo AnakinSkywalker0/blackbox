@@ -1,0 +1,365 @@
+//! `bb selftest`: cause real slowdowns on this machine and check that `bb why` names them.
+//!
+//! Each scenario records live samples through the real pipeline (sampler, storage,
+//! window query, rule engine) while child processes generate a known load, then checks
+//! the explanation. A quiet control run measures false alarms. Things that can't be
+//! caused from software (heat, battery limits, a failing disk) are listed as not tested.
+
+use bb_core::model::{Finding, Sample};
+use bb_core::rules::{analyze, Thresholds};
+use bb_core::sampler::{raise_priority, Sampler};
+use bb_core::store::Store;
+use std::io::{Seek, SeekFrom, Write};
+use std::process::{Child, Command, Stdio};
+use std::time::{Duration, Instant};
+use sysinfo::System;
+
+type Res = Result<(), String>;
+
+const MB: u64 = 1024 * 1024;
+
+/// What a scenario must produce for the run to count as a detection.
+enum Expect {
+    /// No explanation at all (a quiet machine).
+    Nothing,
+    /// At least one finding accepted by this check.
+    Finding(fn(&Finding) -> bool),
+}
+
+struct Scenario {
+    name: &'static str,
+    induced: String,
+    calm_before: u64,
+    load: u64,
+    calm_after: u64,
+    /// Worker processes to launch when the load phase starts: (kind, count, megabytes).
+    workers: Vec<(&'static str, usize, u64)>,
+    expect: Expect,
+}
+
+struct Outcome {
+    name: &'static str,
+    pass: bool,
+    ranked_first: bool,
+    detail: String,
+    extras: Vec<String>,
+    samples: usize,
+    expected_samples: u64,
+}
+
+// ---- workers (run as child processes of this same program) -----------------------
+
+/// Entry point for `bb selftest-worker`. Generates one kind of load, then exits.
+pub fn worker(kind: &str, secs: u64, mb: u64) -> Res {
+    let end = Instant::now() + Duration::from_secs(secs);
+    match kind {
+        "cpu" => {
+            let mut x = 1.0f64;
+            while Instant::now() < end {
+                for _ in 0..200_000 {
+                    x = x * 1.000_000_1 + 1e-9;
+                }
+                std::hint::black_box(x);
+            }
+            Ok(())
+        }
+        "mem" => {
+            // Touch every page so the memory is really used, not just reserved.
+            let mut held: Vec<Vec<u8>> = Vec::new();
+            for _ in 0..(mb / 64).max(1) {
+                let mut chunk = vec![0u8; (64 * MB) as usize];
+                for i in (0..chunk.len()).step_by(4096) {
+                    chunk[i] = 1;
+                }
+                held.push(chunk);
+            }
+            while Instant::now() < end {
+                std::thread::sleep(Duration::from_millis(200));
+            }
+            std::hint::black_box(&held);
+            Ok(())
+        }
+        "disk" => {
+            let path = std::env::temp_dir().join(format!("bb-selftest-{}.tmp", std::process::id()));
+            let buf = vec![0xA5u8; (32 * MB) as usize];
+            let mut f = std::fs::File::create(&path).map_err(|e| e.to_string())?;
+            let mut written = 0u64;
+            while Instant::now() < end {
+                f.write_all(&buf).map_err(|e| e.to_string())?;
+                f.sync_data().map_err(|e| e.to_string())?; // force it to the device
+                written += buf.len() as u64;
+                if written > 2048 * MB {
+                    f.seek(SeekFrom::Start(0)).map_err(|e| e.to_string())?;
+                    written = 0;
+                }
+            }
+            drop(f);
+            let _ = std::fs::remove_file(&path);
+            Ok(())
+        }
+        other => Err(format!("unknown worker kind '{other}'")),
+    }
+}
+
+fn spawn_workers(plan: &[(&'static str, usize, u64)], secs: u64) -> Vec<Child> {
+    let exe = match std::env::current_exe() {
+        Ok(e) => e,
+        Err(_) => return Vec::new(),
+    };
+    let mut kids = Vec::new();
+    for (kind, count, mb) in plan {
+        for _ in 0..*count {
+            let mut c = Command::new(&exe);
+            c.args(["selftest-worker", kind, "--secs", &secs.to_string(), "--mb", &mb.to_string()]);
+            c.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+            #[cfg(windows)]
+            {
+                use std::os::windows::process::CommandExt;
+                c.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+            }
+            if let Ok(child) = c.spawn() {
+                kids.push(child);
+            }
+        }
+    }
+    kids
+}
+
+fn stop_workers(kids: &mut Vec<Child>) {
+    for k in kids.iter_mut() {
+        let _ = k.kill();
+        let _ = k.wait();
+    }
+    kids.clear();
+}
+
+// ---- the checks ---------------------------------------------------------------------
+
+fn is_cpu_cause(f: &Finding) -> bool {
+    // Either one program named as the hog (this program's own workers), or saturation.
+    (f.title.starts_with("bb") && f.title.contains("large share of the CPU")) || f.title.contains("saturated")
+}
+fn is_cpu_spike(f: &Finding) -> bool {
+    f.title.contains("short CPU spike")
+}
+fn is_memory(f: &Finding) -> bool {
+    f.title.starts_with("Memory pressure")
+}
+fn is_disk(f: &Finding) -> bool {
+    f.title == "Heavy disk activity"
+}
+
+/// Memory to allocate to push usage to about 93%, or why it isn't safe to try.
+fn memory_plan() -> Result<u64, String> {
+    let mut sys = System::new();
+    sys.refresh_memory();
+    let (total, used) = (sys.total_memory(), sys.used_memory());
+    let target = (total as f64 * 0.93) as u64;
+    if used >= target {
+        return Err("memory is already above 93% full".into());
+    }
+    let need = target - used;
+    let available = total - used;
+    if need > 10 * 1024 * MB {
+        return Err(format!("it would need {} GB, more than the 10 GB safety cap", need / (1024 * MB)));
+    }
+    if available < need + 700 * MB {
+        return Err("not enough free memory to do it without starving other programs".into());
+    }
+    Ok(need / MB)
+}
+
+fn scenarios(cores: usize, include_memory: bool) -> Vec<Result<Scenario, (String, String)>> {
+    let mut v: Vec<Result<Scenario, (String, String)>> = vec![
+        Ok(Scenario {
+            name: "control",
+            induced: "nothing: 25 s of an idle machine".into(),
+            calm_before: 25,
+            load: 0,
+            calm_after: 0,
+            workers: vec![],
+            expect: Expect::Nothing,
+        }),
+        Ok(Scenario {
+            name: "cpu_hog",
+            induced: format!("{cores} programs spinning for 20 s"),
+            calm_before: 5,
+            load: 20,
+            calm_after: 3,
+            workers: vec![("cpu", cores, 0)],
+            expect: Expect::Finding(is_cpu_cause),
+        }),
+        Ok(Scenario {
+            name: "cpu_spike",
+            induced: "all cores busy for 7 s inside a quiet 35 s".into(),
+            calm_before: 20,
+            load: 7,
+            calm_after: 8,
+            workers: vec![("cpu", cores, 0)],
+            expect: Expect::Finding(is_cpu_spike),
+        }),
+        Ok(Scenario {
+            name: "disk_heavy",
+            induced: "sustained forced disk writes for 15 s".into(),
+            calm_before: 3,
+            load: 15,
+            calm_after: 2,
+            workers: vec![("disk", 1, 0)],
+            expect: Expect::Finding(is_disk),
+        }),
+    ];
+    if include_memory {
+        v.push(match memory_plan() {
+            Ok(mb) => Ok(Scenario {
+                name: "memory",
+                induced: format!("{} GB held for 20 s (about 93% full)", mb / 1024 + 1),
+                calm_before: 2,
+                load: 20,
+                calm_after: 2,
+                workers: vec![("mem", 1, mb)],
+                expect: Expect::Finding(is_memory),
+            }),
+            Err(why) => Err(("memory".into(), why)),
+        });
+    } else {
+        v.push(Err(("memory".into(), "skipped by default because it makes the machine sluggish for a moment. Add --memory to run it".into())));
+    }
+    v
+}
+
+fn run_scenario(sc: &Scenario) -> Outcome {
+    let total = sc.calm_before + sc.load + sc.calm_after;
+    let mut sampler = Sampler::new(5);
+    std::thread::sleep(Duration::from_millis(600));
+    let mut samples: Vec<Sample> = Vec::new();
+    let mut kids: Vec<Child> = Vec::new();
+    let start = Instant::now();
+    let mut started = false;
+    for tick in 1..=total {
+        let at = start + Duration::from_secs(tick);
+        // Start and stop the load on schedule (relative to when each second began).
+        let elapsed = tick - 1;
+        if !started && sc.load > 0 && elapsed >= sc.calm_before {
+            kids = spawn_workers(&sc.workers, sc.load);
+            started = true;
+        }
+        if started && elapsed >= sc.calm_before + sc.load {
+            stop_workers(&mut kids);
+        }
+        let now = Instant::now();
+        if at > now {
+            std::thread::sleep(at - now);
+        }
+        samples.push(sampler.sample(chrono::Local::now().timestamp()));
+    }
+    stop_workers(&mut kids);
+
+    // Through the real storage path, as `bb why` would see it.
+    let findings = match Store::open_in_memory().and_then(|mut st| {
+        st.insert_many(&samples)?;
+        let (from, to) = (samples.first().map_or(0, |s| s.ts), samples.last().map_or(0, |s| s.ts));
+        let w = st.window(from, to)?;
+        let best = st.best_mhz()?;
+        Ok(analyze(&w, best, &Thresholds::default()))
+    }) {
+        Ok(f) => f,
+        Err(e) => {
+            return Outcome {
+                name: sc.name,
+                pass: false,
+                ranked_first: false,
+                detail: format!("storage error: {e}"),
+                extras: vec![],
+                samples: samples.len(),
+                expected_samples: total,
+            }
+        }
+    };
+
+    let (pass, ranked_first, detail, extras) = match &sc.expect {
+        Expect::Nothing => {
+            if findings.is_empty() {
+                (true, true, "no findings, as it should be".to_string(), vec![])
+            } else {
+                let t: Vec<String> = findings.iter().map(|f| f.title.clone()).collect();
+                (false, false, format!("FALSE ALARM: {}", t.join("; ")), vec![])
+            }
+        }
+        Expect::Finding(ok) => match findings.iter().position(|f| ok(f)) {
+            Some(i) => {
+                let extras = findings.iter().enumerate().filter(|(j, _)| *j != i).map(|(_, f)| f.title.clone()).collect();
+                (true, i == 0, findings[i].title.clone(), extras)
+            }
+            None => {
+                let seen = if findings.is_empty() { "nothing".to_string() } else { findings.iter().map(|f| f.title.clone()).collect::<Vec<_>>().join("; ") };
+                (false, false, format!("MISSED. bb why said: {seen}"), vec![])
+            }
+        },
+    };
+    Outcome { name: sc.name, pass, ranked_first, detail, extras, samples: samples.len(), expected_samples: total }
+}
+
+// ---- the command --------------------------------------------------------------------
+
+pub fn run(only: &[String], include_memory: bool, recorder_running: bool) -> Res {
+    raise_priority();
+    let cores = std::thread::available_parallelism().map_or(2, |n| n.get());
+    println!("blackbox selftest: causing real slowdowns and checking that `bb why` names them.");
+    println!("The machine will be busy for a few minutes. Close heavy programs first for a cleaner result.");
+    if recorder_running {
+        println!("Note: a recorder is running, so its history will contain these test loads. They will show up in");
+        println!("`bb why` for this time. Run `bb stop` first (and `bb start` after) to keep your history clean.");
+    }
+    println!();
+
+    let all = scenarios(cores, include_memory);
+    let mut outcomes: Vec<Outcome> = Vec::new();
+    let mut skipped: Vec<(String, String)> = Vec::new();
+    for item in all {
+        match item {
+            Err((name, why)) => skipped.push((name, why)),
+            Ok(sc) => {
+                if !only.is_empty() && !only.iter().any(|o| o == sc.name) {
+                    continue;
+                }
+                println!("  running {:<10} {} ...", sc.name, sc.induced);
+                let o = run_scenario(&sc);
+                println!("  -> {}", if o.pass { "pass" } else { "FAIL" });
+                outcomes.push(o);
+            }
+        }
+    }
+
+    println!("\n{:<11} {:<5} {:<7} {}", "SCENARIO", "", "RANK", "WHAT `bb why` SAID");
+    for o in &outcomes {
+        let rank = if o.name == "control" { "-" } else if o.ranked_first { "1st" } else if o.pass { "later" } else { "-" };
+        println!("{:<11} {:<5} {:<7} {}", o.name, if o.pass { "PASS" } else { "FAIL" }, rank, o.detail);
+        for e in &o.extras {
+            println!("{:<24} also reported: {e}", "");
+        }
+        if o.samples as u64 + 2 < o.expected_samples {
+            println!("{:<24} note: only {} of {} samples were recorded, so the machine was too busy to sample every second", "", o.samples, o.expected_samples);
+        }
+    }
+
+    let induced: Vec<&Outcome> = outcomes.iter().filter(|o| o.name != "control").collect();
+    let detected = induced.iter().filter(|o| o.pass).count();
+    let first = induced.iter().filter(|o| o.pass && o.ranked_first).count();
+    let false_alarms = outcomes.iter().filter(|o| o.name == "control" && !o.pass).count();
+    println!("\nDetected {detected} of {} induced slowdowns ({first} as the top explanation). False alarms on a quiet machine: {false_alarms}.", induced.len());
+
+    if !skipped.is_empty() {
+        println!("\nNot run:");
+        for (n, why) in &skipped {
+            println!("  {n}: {why}");
+        }
+    }
+    println!("\nCan't be caused from software, so only covered by synthetic tests, not real ones:");
+    println!("  heat/thermal throttling, battery and power-mode limits, GPU load or throttling, a slow or failing disk, machine stalls.");
+
+    let failed = outcomes.iter().filter(|o| !o.pass).count();
+    if failed > 0 {
+        return Err(format!("{failed} scenario(s) failed"));
+    }
+    Ok(())
+}

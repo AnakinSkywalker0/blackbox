@@ -17,6 +17,9 @@ pub struct Thresholds {
     pub mem_full_pct: f32,
     pub mem_high_pct: f32,
     pub swap_high_bytes: u64,
+    /// Memory pages written out to disk per second, sustained for a few seconds, that
+    /// counts as active paging. A healthy machine sits near zero.
+    pub paging_pages_per_sec: f32,
     /// CPU must be at least this busy for throttling to be suspected.
     pub throttle_busy_pct: f32,
     /// Speed at or below this fraction of the maximum means throttling.
@@ -50,6 +53,7 @@ impl Default for Thresholds {
             mem_full_pct: 90.0,
             mem_high_pct: 80.0,
             swap_high_bytes: 1 << 30,
+            paging_pages_per_sec: 200.0,
             throttle_busy_pct: 60.0,
             throttle_clock_ratio: 0.75,
             disk_heavy_bps: 80 * 1024 * 1024,
@@ -67,6 +71,28 @@ impl Default for Thresholds {
             spike_disk_ms: 300.0,
         }
     }
+}
+
+/// A stable name for the kind of cause a finding title describes, so feedback can be
+/// tallied per rule. Program names inside titles don't matter.
+pub fn kind_of(title: &str) -> &'static str {
+    let t = title;
+    if t.contains("large share of the CPU") { "cpu_hog" }
+    else if t.contains("saturated by many programs") { "cpu_saturated" }
+    else if t.starts_with("Memory pressure") { "memory" }
+    else if t.contains("throttling") && t.contains("CPU") { "cpu_throttle" }
+    else if t.contains("Battery Saver was limiting") { "battery_saver" }
+    else if t.contains("nearly empty battery") { "battery_low" }
+    else if t.starts_with("GPU throttled") || t.starts_with("GPU limited") || t.starts_with("GPU slowed") { "gpu_throttle" }
+    else if t.contains("GPU was maxed out") { "gpu_busy" }
+    else if t.contains("GPU was running very hot") { "gpu_hot" }
+    else if t.contains("machine was running very hot") { "hot" }
+    else if t == "Heavy disk activity" { "disk_heavy" }
+    else if t.contains("slow to respond") { "disk_slow" }
+    else if t.contains("short CPU spike") { "cpu_spike" }
+    else if t.contains("brief disk stall") { "disk_stall" }
+    else if t.contains("machine stalled") { "stall" }
+    else { "other" }
 }
 
 /// Advice for programs we recognise, matched case-insensitively.
@@ -236,8 +262,16 @@ pub fn analyze(samples: &[Sample], best_mhz: u32, t: &Thresholds) -> Vec<Finding
         if s.mem_total == 0 { 0.0 } else { s.mem_used as f64 * 100.0 / s.mem_total as f64 }
     }) as f32;
     let swap = mean(samples, |s| s.swap_used as f64);
+    // High memory plus a big pagefile is only a problem if the system is actually
+    // paging. When that is measured, require it, so a machine that just sits at 80%
+    // with swap allocated doesn't get blamed in every explanation.
+    let paging_measured = avg_of(samples, |s| s.sensors.page_out).is_some();
+    let page_peak = rolling_peak(samples, 5, |s| s.sensors.page_out)
+        .map(|(_, p)| p)
+        .or_else(|| samples.iter().filter_map(|s| s.sensors.page_out).fold(None, |m: Option<f32>, v| Some(m.map_or(v, |m| m.max(v)))));
+    let paging_active = page_peak.is_some_and(|p| p >= t.paging_pages_per_sec);
     let full = mem_pct >= t.mem_full_pct;
-    let paging = mem_pct >= t.mem_high_pct && swap >= t.swap_high_bytes as f64;
+    let paging = mem_pct >= t.mem_high_pct && swap >= t.swap_high_bytes as f64 && (!paging_measured || paging_active);
     if full || paging {
         let biggest = progs.iter().max_by(|a, b| a.mem_bytes.total_cmp(&b.mem_bytes));
         let mut evidence = vec![
@@ -249,10 +283,15 @@ pub fn analyze(samples: &[Sample], best_mhz: u32, t: &Thresholds) -> Vec<Finding
             evidence.push(format!("largest memory user: {} at {:.1} GB", label(p), p.mem_bytes / GB));
             hint = hint_for(&p.name).map(str::to_string);
         }
+        match (paging_active, page_peak) {
+            (true, Some(p)) => evidence.push(format!("the system was pushing up to {:.0} MB/s of memory out to disk", p as f64 * 4.0 / 1024.0)),
+            (false, _) if paging_measured => evidence.push("no heavy paging was measured, so the real effect may be small".into()),
+            _ => {}
+        }
         out.push(Finding {
             title: "Memory pressure, the machine was short on RAM".into(),
             evidence,
-            confidence: if full && swap >= t.swap_high_bytes as f64 {
+            confidence: if (full && swap >= t.swap_high_bytes as f64) || paging_active {
                 Confidence::High
             } else {
                 Confidence::Medium
@@ -637,6 +676,7 @@ mod tests {
                 gpu_throttle: Some(0),
                 disk_queue: Some(0.1),
                 disk_latency_ms: Some(1.5),
+                page_out: Some(0.0),
             }
         });
         assert!(run(&w).is_empty(), "{:?}", titles(&run(&w)));
@@ -717,6 +757,53 @@ mod tests {
         assert_eq!(run(&w).len(), 1);
         // Same memory with no pagefile use is fine.
         assert!(run(&window(|s| s.mem_used = 13 << 30)).is_empty());
+    }
+
+    #[test]
+    fn static_swap_without_paging_is_not_blamed() {
+        // 81% full with 2 GB of swap allocated, but nothing is being paged out.
+        let w = window(|s| {
+            s.mem_used = 13 << 30;
+            s.swap_used = 2 << 30;
+            s.sensors.page_out = Some(0.0);
+        });
+        assert!(run(&w).is_empty(), "{:?}", titles(&run(&w)));
+    }
+
+    #[test]
+    fn high_memory_with_active_paging_is_reported() {
+        let w = window(|s| {
+            s.mem_used = 13 << 30;
+            s.swap_used = 2 << 30;
+            s.sensors.page_out = Some(3000.0);
+        });
+        let f = run(&w);
+        assert_eq!(f.len(), 1, "{:?}", titles(&f));
+        assert!(f[0].title.contains("Memory pressure"));
+        assert!(f[0].evidence.iter().any(|e| e.contains("MB/s")));
+        assert_eq!(f[0].confidence, Confidence::High);
+    }
+
+    #[test]
+    fn full_memory_without_paging_is_reported_with_a_caveat() {
+        let w = window(|s| {
+            s.mem_used = 15 << 30; // 94%
+            s.sensors.page_out = Some(0.0);
+        });
+        let f = run(&w);
+        assert_eq!(f.len(), 1, "{:?}", titles(&f));
+        assert!(f[0].evidence.iter().any(|e| e.contains("no heavy paging")));
+    }
+
+    #[test]
+    fn a_short_paging_burst_counts() {
+        // 6 seconds of heavy paging inside a minute of 82% memory with swap.
+        let w = window_i(|i, s| {
+            s.mem_used = 13 << 30;
+            s.swap_used = 2 << 30;
+            s.sensors.page_out = Some(if (20..26).contains(&i) { 5000.0 } else { 0.0 });
+        });
+        assert_eq!(run(&w).len(), 1);
     }
 
     #[test]
@@ -1013,6 +1100,39 @@ mod tests {
         assert_eq!(f.len(), 1, "{:?}", titles(&f));
         assert!(f[0].title.contains("disk stall"));
         assert!(f[0].evidence[0].contains("650"));
+    }
+
+    #[test]
+    fn every_rule_title_maps_to_a_kind() {
+        // Build each finding through the real rules and check none falls into "other".
+        let cases: Vec<Vec<Sample>> = vec![
+            window(|s| { s.cpu_pct = 70.0; s.procs.push(proc("x.exe", 1, 55.0, 1, 0.1)); }),
+            window(|s| { s.cpu_pct = 95.0; s.procs = (0..5).map(|i| proc(&format!("a{i}.exe"), 1, 18.0, 0, 0.2)).collect(); }),
+            window(|s| { s.mem_used = 15 << 30; s.swap_used = 3 << 30; }),
+            window(|s| { busy(s); s.sensors.freq_pct = Some(50.0); s.sensors.temp_c = Some(60.0); }),
+            window(|s| { busy(s); s.sensors.freq_pct = Some(50.0); s.sensors.battery_saver = Some(true); }),
+            window(|s| { s.cpu_pct = 40.0; s.sensors = Sensors { on_ac: Some(false), battery_pct: Some(9), ..Default::default() }; }),
+            window(|s| s.sensors.temp_c = Some(95.0)),
+            window(|s| s.sensors = Sensors { gpu_pct: Some(99.0), gpu_throttle: Some(GPU_THERMAL), gpu_temp_c: Some(88.0), ..Default::default() }),
+            window(|s| s.sensors.gpu_pct = Some(98.0)),
+            window(|s| s.sensors.gpu_temp_c = Some(90.0)),
+            window(|s| { s.disk_bps = 200 << 20; s.procs.push(proc("c.exe", 1, 3.0, 190, 0.1)); }),
+            window(|s| s.sensors.disk_latency_ms = Some(180.0)),
+            window_i(|i, s| { if (30..36).contains(&i) { s.cpu_pct = 99.0; } }),
+            window_i(|i, s| s.sensors.disk_latency_ms = Some(if i == 40 { 650.0 } else { 3.0 })),
+            (0..60i64).filter(|i| !(30..38).contains(i)).map(|i| Sample { ts: 1000 + i, mem_total: 16 << 30, ..Default::default() }).collect(),
+        ];
+        let mut kinds = std::collections::BTreeSet::new();
+        for w in &cases {
+            let f = run(w);
+            assert!(!f.is_empty());
+            for x in f {
+                let k = kind_of(&x.title);
+                assert_ne!(k, "other", "unmapped title: {}", x.title);
+                kinds.insert(k);
+            }
+        }
+        assert!(kinds.len() >= 12, "only exercised {kinds:?}");
     }
 
     #[test]

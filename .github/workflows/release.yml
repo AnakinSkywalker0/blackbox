@@ -25,15 +25,34 @@ jobs:
           - name: windows-x86_64
             os: windows-latest
             exe: bb.exe
+            bindir: target/release
+            smoke: true
           - name: linux-x86_64
             os: ubuntu-latest
             exe: bb
+            bindir: target/release
+            smoke: true
+          - name: macos-arm64
+            os: macos-latest
+            exe: bb
+            bindir: target/release
+            smoke: true
+          # Built on the Apple Silicon runner. Tested natively by the arm64 job above, and
+          # not run here (the runner may not have Rosetta).
+          - name: macos-x86_64
+            os: macos-latest
+            exe: bb
+            target: x86_64-apple-darwin
+            bindir: target/x86_64-apple-darwin/release
+            smoke: false
     defaults:
       run:
         shell: bash
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
 
       - name: Check the tag matches the crate version
@@ -46,10 +65,11 @@ jobs:
           fi
 
       - name: Tests
+        if: ${{ !matrix.target }}
         run: cargo test --workspace --locked
 
       - name: Build
-        run: cargo build --release --locked -p bb-cli
+        run: cargo build --release --locked -p bb-cli ${{ matrix.target && format('--target {0}', matrix.target) || '' }}
 
       - name: Package
         id: pack
@@ -57,7 +77,7 @@ jobs:
           version=$(grep -m1 '^version' bb-cli/Cargo.toml | cut -d'"' -f2)
           dir="bb-v${version}-${{ matrix.name }}"
           mkdir "$dir"
-          cp "target/release/${{ matrix.exe }}" README.md LICENSE "$dir/"
+          cp "${{ matrix.bindir }}/${{ matrix.exe }}" README.md LICENSE "$dir/"
           if [ "${{ runner.os }}" = "Windows" ]; then
             asset="$dir.zip"
             7z a -tzip "$asset" "$dir" > /dev/null
@@ -69,6 +89,7 @@ jobs:
           echo "asset=$asset" >> "$GITHUB_OUTPUT"
 
       - name: Smoke test the packaged binary
+        if: matrix.smoke
         run: |
           dir="bb-v$(grep -m1 '^version' bb-cli/Cargo.toml | cut -d'"' -f2)-${{ matrix.name }}"
           "./$dir/${{ matrix.exe }}" --version
@@ -154,6 +175,19 @@ jobs:
           name: winget-manifests
           path: winget-out
           if-no-files-found: error
+      # Fixed names (no version), so these links always give the newest release:
+      #   https://github.com/AnakinSkywalker0/blackbox/releases/latest/download/bb-setup-x64.exe
+      - name: Add fixed-name copies of each download
+        run: |
+          cd dist
+          for f in bb-v*-setup-x64.exe bb-v*-windows-x86_64.zip bb-v*-linux-x86_64.tar.gz bb-v*-macos-arm64.tar.gz bb-v*-macos-x86_64.tar.gz; do
+            [ -f "$f" ] || continue
+            stable=$(echo "$f" | sed -E 's/^bb-v[0-9][^-]*-/bb-/')
+            cp "$f" "$stable"
+            sha256sum "$stable" > "$stable.sha256"
+          done
+          ls -l
+
       - uses: softprops/action-gh-release@v2
         with:
           files: dist/*
@@ -166,5 +200,17 @@ jobs:
             Windows may warn about an unknown publisher because the installer isn't code-signed yet: click **More info**, then **Run anyway**. You can check the download against its `.sha256` file.
 
             Uninstall from Windows Settings > Apps, or run `bb uninstall`. Your recorded data is kept.
+
+            ## Install (Linux and macOS)
+
+            ```
+            curl -fsSL https://raw.githubusercontent.com/AnakinSkywalker0/blackbox/main/install.sh | sh
+            ```
+
+            Or download the `.tar.gz` for your system below, unpack it and run `./bb install`.
+
+            ## Always the latest
+
+            Windows: `https://github.com/AnakinSkywalker0/blackbox/releases/latest/download/bb-setup-x64.exe`
 
             Prefer a zip? The `windows-x86_64` zip contains `bb.exe`; run `bb.exe install`.

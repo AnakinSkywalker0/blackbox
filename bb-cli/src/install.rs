@@ -301,14 +301,149 @@ pub fn uninstall(db: &Path, purge: bool) -> Res {
     Ok(())
 }
 
-#[cfg(not(windows))]
-pub fn install(_db: &Path, _no_autostart: bool) -> Res {
-    Err("`install` is Windows-only for now. Copy bb onto your PATH and run `bb start`.".into())
+// ---- Linux and macOS ---------------------------------------------------------------
+
+/// The XDG autostart entry that starts the recorder when a desktop session begins.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub fn desktop_entry(exe: &Path) -> String {
+    format!(
+        "[Desktop Entry]\nType=Application\nName=blackbox\nComment=Background performance recorder\nExec=\"{}\" start --quiet\nTerminal=false\nX-GNOME-Autostart-enabled=true\n",
+        exe.display()
+    )
 }
 
-#[cfg(not(windows))]
+/// The macOS LaunchAgent that starts the recorder at login. `bb start` returns at once and
+/// leaves the recorder running, so launchd must not clean up the process group.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub fn launch_agent_plist(exe: &Path) -> String {
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\">\n<dict>\n  <key>Label</key><string>{LAUNCH_LABEL}</string>\n  <key>ProgramArguments</key>\n  <array><string>{}</string><string>start</string><string>--quiet</string></array>\n  <key>RunAtLoad</key><true/>\n  <key>AbandonProcessGroup</key><true/>\n</dict>\n</plist>\n",
+        exe.display()
+    )
+}
+
+#[cfg(unix)]
+const LAUNCH_LABEL: &str = "io.github.anakinskywalker0.blackbox";
+#[cfg(not(unix))]
+#[allow(dead_code)]
+const LAUNCH_LABEL: &str = "io.github.anakinskywalker0.blackbox";
+
+#[cfg(unix)]
+fn home() -> Result<PathBuf, String> {
+    std::env::var_os("HOME").filter(|h| !h.is_empty()).map(PathBuf::from).ok_or_else(|| "HOME isn't set".to_string())
+}
+
+/// Where `bb install` puts the program (the usual per-user bin folder).
+#[cfg(unix)]
+pub fn install_dir() -> PathBuf {
+    home().unwrap_or_else(|_| PathBuf::from(".")).join(".local").join("bin")
+}
+
+#[cfg(target_os = "macos")]
+fn autostart_file(home: &Path) -> PathBuf {
+    home.join("Library/LaunchAgents").join(format!("{LAUNCH_LABEL}.plist"))
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn autostart_file(home: &Path) -> PathBuf {
+    home.join(".config/autostart/blackbox.desktop")
+}
+
+#[cfg(unix)]
+fn autostart_contents(exe: &Path) -> String {
+    if cfg!(target_os = "macos") { launch_agent_plist(exe) } else { desktop_entry(exe) }
+}
+
+/// Best effort: tells launchd about the agent now, so it needn't wait for the next login.
+#[cfg(target_os = "macos")]
+fn launchctl(verb: &str, plist: &Path) {
+    let uid = Command::new("id").arg("-u").output().ok().map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string()).unwrap_or_default();
+    let _ = Command::new("launchctl").args([verb, &format!("gui/{uid}")]).arg(plist).stdout(Stdio::null()).stderr(Stdio::null()).status();
+}
+
+#[cfg(unix)]
+pub fn install(db: &Path, no_autostart: bool) -> Res {
+    use std::os::unix::fs::PermissionsExt;
+    let home = home()?;
+    let dir = install_dir();
+    let dest = dir.join("bb");
+    let me = std::env::current_exe().map_err(|e| e.to_string())?;
+
+    fs::create_dir_all(&dir).map_err(|e| format!("can't create {}: {e}", dir.display()))?;
+    if fs::canonicalize(&me).ok() != fs::canonicalize(&dest).ok() {
+        stop(db, true)?;
+        // Write beside the target and rename, so a running copy is never half-overwritten.
+        let tmp = dir.join("bb.new");
+        fs::copy(&me, &tmp).map_err(|e| format!("can't copy to {}: {e}", dir.display()))?;
+        fs::set_permissions(&tmp, fs::Permissions::from_mode(0o755)).map_err(|e| e.to_string())?;
+        fs::rename(&tmp, &dest).map_err(|e| format!("can't install to {}: {e}", dest.display()))?;
+    }
+    println!("Installed:        {}", dest.display());
+
+    let on_path = std::env::var_os("PATH").is_some_and(|p| std::env::split_paths(&p).any(|d| d == dir));
+    if on_path {
+        println!("PATH:             already set");
+    } else {
+        println!("PATH:             {} is not on your PATH yet. Add this to your shell profile:", dir.display());
+        println!("                  export PATH=\"$HOME/.local/bin:$PATH\"");
+    }
+
+    if no_autostart {
+        println!("Start at login:   skipped");
+    } else {
+        let file = autostart_file(&home);
+        if let Some(parent) = file.parent() {
+            fs::create_dir_all(parent).map_err(|e| format!("can't create {}: {e}", parent.display()))?;
+        }
+        fs::write(&file, autostart_contents(&dest)).map_err(|e| format!("can't write {}: {e}", file.display()))?;
+        #[cfg(target_os = "macos")]
+        launchctl("bootstrap", &file);
+        println!("Start at login:   on ({})", file.display());
+    }
+    let status = Command::new(&dest).arg("--db").arg(db).arg("start").status().map_err(|e| e.to_string())?;
+    if !status.success() {
+        return Err("installed, but the recorder failed to start".into());
+    }
+    println!("\nDone. Try `bb status`, and `bb why \"10m ago\"` when something feels slow.");
+    Ok(())
+}
+
+#[cfg(unix)]
+pub fn uninstall(db: &Path, purge: bool) -> Res {
+    let home = home()?;
+    stop(db, true)?;
+    let file = autostart_file(&home);
+    if file.exists() {
+        #[cfg(target_os = "macos")]
+        launchctl("bootout", &file);
+        fs::remove_file(&file).map_err(|e| format!("can't remove {}: {e}", file.display()))?;
+        println!("Start at login:   removed");
+    }
+    let exe = install_dir().join("bb");
+    if exe.exists() {
+        fs::remove_file(&exe).map_err(|e| format!("can't remove {}: {e}", exe.display()))?;
+        println!("Program:          removed ({})", exe.display());
+    }
+    if purge {
+        for ext in ["", "-wal", "-shm"] {
+            let _ = fs::remove_file(format!("{}{}", db.display(), ext));
+        }
+        println!("Recorded data:    deleted");
+    } else {
+        println!("Recorded data:    kept at {} (use --purge to delete)", db.display());
+    }
+    println!("Uninstalled.");
+    Ok(())
+}
+
+#[cfg(not(any(windows, unix)))]
+pub fn install(_db: &Path, _no_autostart: bool) -> Res {
+    Err("`install` isn't supported on this platform. Copy bb onto your PATH and run `bb start`.".into())
+}
+
+#[cfg(not(any(windows, unix)))]
 pub fn uninstall(_db: &Path, _purge: bool) -> Res {
-    Err("`uninstall` is Windows-only for now. Run `bb stop` and delete the bb binary.".into())
+    Err("`uninstall` isn't supported on this platform. Run `bb stop` and delete the bb binary.".into())
 }
 
 #[cfg(test)]
@@ -316,6 +451,24 @@ mod tests {
     use super::*;
 
     const DIR: &str = r"C:\Users\me\AppData\Local\blackbox\bin";
+
+    #[test]
+    fn linux_autostart_entry_is_valid() {
+        let e = desktop_entry(Path::new("/home/me/.local/bin/bb"));
+        assert!(e.starts_with("[Desktop Entry]\nType=Application\n"));
+        assert!(e.contains("Exec=\"/home/me/.local/bin/bb\" start --quiet\n"));
+        assert!(e.contains("Terminal=false"));
+    }
+
+    #[test]
+    fn macos_launch_agent_is_valid() {
+        let p = launch_agent_plist(Path::new("/Users/me/.local/bin/bb"));
+        assert!(p.contains("<key>Label</key><string>io.github.anakinskywalker0.blackbox</string>"));
+        assert!(p.contains("<string>/Users/me/.local/bin/bb</string><string>start</string><string>--quiet</string>"));
+        assert!(p.contains("<key>RunAtLoad</key><true/>"));
+        assert!(p.contains("<key>AbandonProcessGroup</key><true/>"));
+        assert!(p.trim_end().ends_with("</plist>"));
+    }
 
     #[test]
     fn adds_once() {

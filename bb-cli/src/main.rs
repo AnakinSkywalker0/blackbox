@@ -1,4 +1,5 @@
 mod install;
+mod selftest;
 mod update;
 
 use bb_core::model::{Sample, Sensors, GPU_HW, GPU_POWER, GPU_THERMAL};
@@ -97,10 +98,41 @@ enum Cmd {
         #[arg(long, default_value = "4m")]
         span: String,
     },
+    /// Tell blackbox whether the last `bb why` was right (stays on this machine)
+    Feedback {
+        /// right, partly or wrong
+        verdict: Option<String>,
+        /// An optional note, for example what the real cause was
+        #[arg(short, long)]
+        note: Option<String>,
+        /// Show how often each kind of explanation was judged right
+        #[arg(long)]
+        summary: bool,
+        /// Print all feedback as JSON, to share if you want to help tune the rules
+        #[arg(long)]
+        export: bool,
+    },
     /// Show what has been recorded
     Status,
     /// Show which sensors (battery, temperature, GPU, disk latency) work on this machine
     Sensors,
+    /// Cause real slowdowns on this machine and check that `bb why` names them
+    Selftest {
+        /// Run only these scenarios (control, cpu_hog, cpu_spike, disk_heavy, memory)
+        #[arg(long, value_delimiter = ',')]
+        only: Vec<String>,
+        /// Also run the memory-pressure test (makes the machine sluggish for ~20 s)
+        #[arg(long)]
+        memory: bool,
+    },
+    #[command(hide = true)]
+    SelftestWorker {
+        kind: String,
+        #[arg(long)]
+        secs: u64,
+        #[arg(long, default_value_t = 0)]
+        mb: u64,
+    },
     /// Measure blackbox's own cost on this machine
     Bench {
         /// How long to measure, in seconds
@@ -122,8 +154,11 @@ fn main() {
         Cmd::Update { check } => update::run(&db, check),
         Cmd::Top { n, watch } => top(n, watch),
         Cmd::Why { when, span } => why(&db, &when, &span),
+        Cmd::Feedback { verdict, note, summary, export } => feedback(&db, verdict, note.as_deref().unwrap_or(""), summary, export),
         Cmd::Status => status(&db),
         Cmd::Sensors => sensors(),
+        Cmd::Selftest { only, memory } => selftest::run(&only, memory, install::running_pid(&db).is_some()),
+        Cmd::SelftestWorker { kind, secs, mb } => selftest::worker(&kind, secs, mb),
         Cmd::Bench { secs } => bench(secs),
     };
     if let Err(e) = result {
@@ -336,9 +371,14 @@ fn why(db: &std::path::Path, when: &str, span: &str) -> Res {
     println!("Window: {} to {}  ({} samples)\n", fmt_time(from), fmt_time(to), samples.len());
     let best = store.best_mhz().map_err(|e| e.to_string())?;
     let findings = analyze(&samples, best, &Thresholds::default());
+    // Remember the answer so the user can say whether it was right.
+    let titles: Vec<String> = findings.iter().map(|f| f.title.clone()).collect();
+    let _ = store.log_why(Local::now().timestamp(), from, to, &titles, env!("CARGO_PKG_VERSION"));
+    const ASK: &str = "Was this right? Tell blackbox with: bb feedback right | partly | wrong [--note TEXT]   (stays on this machine)";
     if findings.is_empty() {
         println!("No clear cause. CPU, memory, disk, GPU, heat and power all looked normal in this window.");
         println!("Try a shorter or different --span. It may also be something blackbox can't see yet (network, or a sensor `bb sensors` shows as unavailable).");
+        println!("\n{ASK}");
         return Ok(());
     }
     println!("Most likely causes:\n");
@@ -352,7 +392,72 @@ fn why(db: &std::path::Path, when: &str, span: &str) -> Res {
         }
         println!();
     }
+    println!("{ASK}");
     Ok(())
+}
+
+fn feedback(db: &std::path::Path, verdict: Option<String>, note: &str, summary: bool, export: bool) -> Res {
+    let store = open(db)?;
+    let rows = store.why_log().map_err(|e| e.to_string())?;
+    if export {
+        let json: Vec<serde_json::Value> = rows
+            .iter()
+            .map(|w| serde_json::json!({
+                "asked_at": w.ts, "window_from": w.from_ts, "window_to": w.to_ts,
+                "explanations": w.titles, "version": w.version, "verdict": w.verdict, "note": w.note,
+            }))
+            .collect();
+        println!("{}", serde_json::to_string_pretty(&json).map_err(|e| e.to_string())?);
+        return Ok(());
+    }
+    if summary || verdict.is_none() {
+        print_feedback_summary(&rows);
+        if verdict.is_none() {
+            return Ok(());
+        }
+    }
+    let Some(v) = verdict else { return Ok(()) };
+    let v = v.to_lowercase();
+    if !["right", "partly", "wrong"].contains(&v.as_str()) {
+        return Err(format!("'{v}' isn't right, partly or wrong"));
+    }
+    let note = (!note.trim().is_empty()).then(|| note.trim());
+    match store.set_verdict(&v, note).map_err(|e| e.to_string())? {
+        None => Err("there's no `bb why` answer to judge yet. Run `bb why` first.".into()),
+        Some(w) => {
+            let top = w.titles.first().map_or("no clear cause", |t| t.as_str());
+            println!("Recorded: the answer about {} was {v}.", top);
+            println!("Thanks. This stays on your machine. See the totals with `bb feedback --summary`.");
+            Ok(())
+        }
+    }
+}
+
+/// Tallies verdicts against the top explanation of each answer.
+fn print_feedback_summary(rows: &[bb_core::store::WhyLog]) {
+    use std::collections::BTreeMap;
+    let judged: Vec<_> = rows.iter().filter(|w| w.verdict.is_some()).collect();
+    println!("Explanations given: {}. Judged by you: {}.", rows.len(), judged.len());
+    if judged.is_empty() {
+        println!("After a `bb why`, run `bb feedback right`, `partly` or `wrong` to start building this up.");
+        return;
+    }
+    // kind -> (right, partly, wrong). The verdict is counted against the top explanation.
+    let mut by: BTreeMap<&str, (u32, u32, u32)> = BTreeMap::new();
+    for w in &judged {
+        let kind = w.titles.first().map_or("no_cause", |t| bb_core::rules::kind_of(t));
+        let e = by.entry(kind).or_default();
+        match w.verdict.as_deref() {
+            Some("right") => e.0 += 1,
+            Some("partly") => e.1 += 1,
+            _ => e.2 += 1,
+        }
+    }
+    println!("\n{:<16} {:>6} {:>7} {:>6}", "TOP EXPLANATION", "right", "partly", "wrong");
+    for (k, (r, p, x)) in by {
+        println!("{k:<16} {r:>6} {p:>7} {x:>6}");
+    }
+    println!("\nA cause that is often wrong needs its threshold tuned. `bb feedback --export` prints everything as JSON.");
 }
 
 fn status(db: &std::path::Path) -> Res {

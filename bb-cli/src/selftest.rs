@@ -143,28 +143,28 @@ fn is_cpu_spike(f: &Finding) -> bool {
     f.title.contains("short CPU spike")
 }
 fn is_memory(f: &Finding) -> bool {
-    f.title.starts_with("Memory pressure")
+    f.title.starts_with("Memory pressure") || f.title.contains("short memory squeeze")
 }
 fn is_disk(f: &Finding) -> bool {
     f.title == "Heavy disk activity"
 }
 
-/// Memory to allocate to push usage to about 93%, or why it isn't safe to try.
+/// Memory to hold so that physical RAM runs out by about 1 GB, forcing the OS to page, or
+/// why that isn't safe to try. Just filling RAM isn't enough: Windows compresses memory
+/// and copes without paging, so it is not a slowdown.
 fn memory_plan() -> Result<u64, String> {
     let mut sys = System::new();
     sys.refresh_memory();
     let (total, used) = (sys.total_memory(), sys.used_memory());
-    let target = (total as f64 * 0.93) as u64;
-    if used >= target {
-        return Err("memory is already above 93% full".into());
-    }
-    let need = target - used;
-    let available = total - used;
+    let available = total.saturating_sub(used);
+    let need = available + 1024 * MB;
     if need > 10 * 1024 * MB {
         return Err(format!("it would need {} GB, more than the 10 GB safety cap", need / (1024 * MB)));
     }
-    if available < need + 700 * MB {
-        return Err("not enough free memory to do it without starving other programs".into());
+    // The extra gigabyte has to fit in the pagefile or swap, or the system could run out.
+    let spare_swap = sys.total_swap().saturating_sub(sys.used_swap());
+    if spare_swap < 3 * 1024 * MB {
+        return Err("there isn't at least 3 GB of free swap/pagefile to absorb it safely".into());
     }
     Ok(need / MB)
 }
@@ -212,17 +212,17 @@ fn scenarios(cores: usize, include_memory: bool) -> Vec<Result<Scenario, (String
         v.push(match memory_plan() {
             Ok(mb) => Ok(Scenario {
                 name: "memory",
-                induced: format!("{} GB held for 20 s (about 93% full)", mb / 1024 + 1),
+                induced: format!("{} GB held for 15 s, 1 GB more than is free, so the OS must page", mb / 1024 + 1),
                 calm_before: 2,
-                load: 20,
-                calm_after: 2,
+                load: 15,
+                calm_after: 3,
                 workers: vec![("mem", 1, mb)],
                 expect: Expect::Finding(is_memory),
             }),
             Err(why) => Err(("memory".into(), why)),
         });
     } else {
-        v.push(Err(("memory".into(), "skipped by default because it makes the machine sluggish for a moment. Add --memory to run it".into())));
+        v.push(Err(("memory".into(), "skipped by default: it uses all free memory plus 1 GB for 15 s, so the machine can lag or freeze briefly. Save your work, then add --memory to run it".into())));
     }
     v
 }
@@ -292,11 +292,24 @@ fn run_scenario(sc: &Scenario) -> Outcome {
             }
             None => {
                 let seen = if findings.is_empty() { "nothing".to_string() } else { findings.iter().map(|f| f.title.clone()).collect::<Vec<_>>().join("; ") };
-                (false, false, format!("MISSED. bb why said: {seen}"), vec![])
+                (false, false, format!("MISSED. bb why said: {seen}"), vec![observed(&samples)])
             }
         },
     };
     Outcome { name: sc.name, pass, ranked_first, detail, extras, samples: samples.len(), expected_samples: total }
+}
+
+/// A one-line summary of what the machine actually did, to explain a miss.
+fn observed(samples: &[Sample]) -> String {
+    let n = samples.len().max(1) as f32;
+    let mem = |s: &Sample| if s.mem_total == 0 { 0.0 } else { s.mem_used as f32 * 100.0 / s.mem_total as f32 };
+    let cpu_avg = samples.iter().map(|s| s.cpu_pct).sum::<f32>() / n;
+    let cpu_max = samples.iter().map(|s| s.cpu_pct).fold(0.0, f32::max);
+    let mem_avg = samples.iter().map(mem).sum::<f32>() / n;
+    let mem_max = samples.iter().map(mem).fold(0.0, f32::max);
+    let paging = samples.iter().filter_map(|s| s.sensors.page_out).fold(0.0, f32::max);
+    let disk = samples.iter().map(|s| s.disk_bps).max().unwrap_or(0) / MB;
+    format!("what it saw: CPU avg {cpu_avg:.0}% (max {cpu_max:.0}%), memory avg {mem_avg:.0}% (max {mem_max:.0}%), paging peak {paging:.0} pages/s, disk peak {disk} MB/s")
 }
 
 // ---- the command --------------------------------------------------------------------

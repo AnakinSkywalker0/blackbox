@@ -80,6 +80,7 @@ pub fn kind_of(title: &str) -> &'static str {
     if t.contains("large share of the CPU") { "cpu_hog" }
     else if t.contains("saturated by many programs") { "cpu_saturated" }
     else if t.starts_with("Memory pressure") { "memory" }
+    else if t.contains("short memory squeeze") { "memory_squeeze" }
     else if t.contains("throttling") && t.contains("CPU") { "cpu_throttle" }
     else if t.contains("Battery Saver was limiting") { "battery_saver" }
     else if t.contains("nearly empty battery") { "battery_low" }
@@ -195,6 +196,10 @@ fn avg_of<F: Fn(&Sample) -> Option<f32>>(samples: &[Sample], f: F) -> Option<f32
 fn share_of<F: Fn(&Sample) -> Option<bool>>(samples: &[Sample], f: F) -> Option<f32> {
     let v: Vec<bool> = samples.iter().filter_map(&f).collect();
     (!v.is_empty()).then(|| v.iter().filter(|b| **b).count() as f32 / v.len() as f32)
+}
+
+fn mem_pct_of(s: &Sample) -> f32 {
+    if s.mem_total == 0 { 0.0 } else { (s.mem_used as f64 * 100.0 / s.mem_total as f64) as f32 }
 }
 
 fn hms(ts: i64) -> String {
@@ -320,6 +325,38 @@ pub fn analyze(samples: &[Sample], best_mhz: u32, t: &Thresholds) -> Vec<Finding
             hint,
             score: 58.0 + mem_pct * 0.2,
         });
+    }
+
+    // 3b. A short memory squeeze that the window average dilutes. Needs measured paging,
+    // because a machine can sit nearly full without any harm while the OS compresses memory.
+    if !(full || paging) && paging_measured {
+        if let Some((i, mem_peak)) = rolling_peak(samples, 10, |s| Some(mem_pct_of(s))).filter(|(_, m)| *m >= t.mem_full_pct) {
+            let w = &samples[i..i + 10];
+            let paging_peak = rolling_peak(w, 5, |s| s.sensors.page_out).map(|(_, p)| p).unwrap_or(0.0);
+            if paging_peak >= t.paging_pages_per_sec {
+                let mut top = per_program(w);
+                top.sort_by(|a, b| b.mem_bytes.total_cmp(&a.mem_bytes));
+                let mut evidence = vec![
+                    format!("{} to {}: memory averaged {:.0}% full", hms(w[0].ts), hms(w[w.len() - 1].ts), mem_peak),
+                    format!("the system was pushing up to {:.0} MB/s of memory out to disk", paging_peak as f64 * 4.0 / 1024.0),
+                    format!("the whole window averaged only {mem_pct:.0}% full, so the squeeze is easy to miss"),
+                ];
+                let mut hint = Some(format!("Run `bb why {} --span 30s` to zoom in.", hms(w[w.len() / 2].ts)));
+                if let Some(p) = top.first().filter(|p| p.mem_bytes > 0.0) {
+                    evidence.push(format!("largest memory user then: {} at {:.1} GB", label(p), p.mem_bytes / GB));
+                    if let Some(h) = hint_for(&p.name) {
+                        hint = Some(format!("{h} {}", hint.unwrap_or_default()));
+                    }
+                }
+                out.push(Finding {
+                    title: format!("A short memory squeeze around {}", hms(w[w.len() / 2].ts)),
+                    evidence,
+                    confidence: Confidence::Medium,
+                    hint,
+                    score: 47.0,
+                });
+            }
+        }
     }
 
     // 4. CPU throttling. Prefer the OS's "percent of maximum frequency"; fall back
@@ -838,6 +875,46 @@ mod tests {
     }
 
     #[test]
+    fn a_short_memory_squeeze_is_found_when_paging_confirms_it() {
+        // 14 s at 97% full with heavy paging, inside a minute that averages ~76%.
+        let w = window_i(|i, s| {
+            if (20..34).contains(&i) {
+                s.mem_used = 15_500 << 20;
+                s.sensors.page_out = Some(3000.0);
+            } else {
+                s.sensors.page_out = Some(0.0);
+            }
+        });
+        let f = run(&w);
+        assert_eq!(f.len(), 1, "{:?}", titles(&f));
+        assert!(f[0].title.contains("short memory squeeze"));
+        assert!(f[0].evidence.iter().any(|e| e.contains("MB/s")));
+    }
+
+    #[test]
+    fn nearly_full_memory_without_paging_is_not_a_squeeze() {
+        // The OS is coping (for example by compressing memory), so don't cry wolf.
+        let w = window_i(|i, s| {
+            s.sensors.page_out = Some(0.0);
+            if (20..34).contains(&i) {
+                s.mem_used = 15_500 << 20;
+            }
+        });
+        assert!(run(&w).is_empty(), "{:?}", titles(&run(&w)));
+    }
+
+    #[test]
+    fn a_four_second_memory_blip_is_not_a_squeeze() {
+        let w = window_i(|i, s| {
+            s.sensors.page_out = Some(if (20..24).contains(&i) { 3000.0 } else { 0.0 });
+            if (20..24).contains(&i) {
+                s.mem_used = 15_700 << 20;
+            }
+        });
+        assert!(run(&w).is_empty());
+    }
+
+    #[test]
     fn a_short_paging_burst_counts() {
         // 6 seconds of heavy paging inside a minute of 82% memory with swap.
         let w = window_i(|i, s| {
@@ -1163,6 +1240,7 @@ mod tests {
             window_i(|i, s| { if (30..36).contains(&i) { s.cpu_pct = 99.0; } }),
             window_i(|i, s| s.sensors.disk_latency_ms = Some(if i == 40 { 650.0 } else { 3.0 })),
             (0..60i64).filter(|i| !(30..38).contains(i)).map(|i| Sample { ts: 1000 + i, mem_total: 16 << 30, ..Default::default() }).collect(),
+            window_i(|i, s| { if (20..34).contains(&i) { s.mem_used = 15_500 << 20; s.sensors.page_out = Some(3000.0); } else { s.sensors.page_out = Some(0.0); } }),
         ];
         let mut kinds = std::collections::BTreeSet::new();
         for w in &cases {
@@ -1174,7 +1252,7 @@ mod tests {
                 kinds.insert(k);
             }
         }
-        assert!(kinds.len() >= 12, "only exercised {kinds:?}");
+        assert!(kinds.len() >= 13, "only exercised {kinds:?}");
     }
 
     #[test]

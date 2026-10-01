@@ -32,7 +32,16 @@ and it answers in plain English with evidence.
 
 ## Install
 
-**Prebuilt (Windows):** download the zip from the [Releases page](../../releases), unzip it, and run `bb.exe install`. That is all. No Rust needed. Each release also ships a Linux build and `.sha256` checksums.
+**Prebuilt (Windows):** download `bb-v*-setup-x64.exe` from the [Releases page](../../releases) and run it. No admin rights and no Rust needed. It puts `bb` on your PATH, starts recording, and starts it at every login. Uninstall from Windows Settings > Apps. Windows may warn about an unknown publisher because the installer is not code-signed yet: click **More info**, then **Run anyway**.
+
+**Winget** (once the package is accepted into the winget catalog, see [packaging/winget](packaging/winget/README.md)):
+
+```
+winget install AnakinSkywalker0.blackbox
+winget upgrade AnakinSkywalker0.blackbox
+```
+
+Each release also ships a plain zip (run `bb.exe install`), a Linux build and `.sha256` checksums.
 
 **Or build it from source.** No admin rights are needed to build or run.
 
@@ -368,6 +377,8 @@ blackbox/
     src/main.rs         commands
     src/install.rs      start/stop, install/uninstall
     src/update.rs       bb update (the only code that uses the network)
+  installer/            Inno Setup script for the Windows installer
+  packaging/winget/     winget manifest generator and publishing notes
 ```
 
 Run the tests:

@@ -82,6 +82,49 @@ jobs:
             ${{ steps.pack.outputs.asset }}.sha256
           if-no-files-found: error
 
+      - name: Build the Windows installer
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          choco install innosetup -y --no-progress
+          $version = (Select-String -Path bb-cli/Cargo.toml -Pattern '^version\s*=\s*"(.+)"' | Select-Object -First 1).Matches[0].Groups[1].Value
+          & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" /Qp "/DAppVersion=$version" installer\blackbox.iss
+          if ($LASTEXITCODE -ne 0) { throw "ISCC failed" }
+          $name = "bb-v$version-setup-x64.exe"
+          $hash = (Get-FileHash "dist\$name" -Algorithm SHA256).Hash.ToLower()
+          "$hash  $name" | Set-Content "dist\$name.sha256" -Encoding ascii
+          "INSTALLER_VERSION=$version" | Add-Content $env:GITHUB_ENV
+
+      - name: Smoke test the installer (install, run, uninstall)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $setup = "dist\bb-v$env:INSTALLER_VERSION-setup-x64.exe"
+          $bb = "$env:LOCALAPPDATA\blackbox\bin\bb.exe"
+          $p = Start-Process $setup -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART' -PassThru
+          if (-not $p.WaitForExit(120000)) { throw "installer timed out" }
+          if ($p.ExitCode -ne 0) { throw "installer exit code $($p.ExitCode)" }
+          Start-Sleep 5
+          $said = (& $bb --version).Trim()
+          if ($said -ne "bb $env:INSTALLER_VERSION") { throw "installed program says '$said'" }
+          & $bb status
+          if (-not (Get-Process bb -ErrorAction SilentlyContinue)) { throw "the recorder isn't running after install" }
+          if (-not (Get-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run').blackbox) { throw "start at login wasn't registered" }
+          $un = Start-Process "$env:LOCALAPPDATA\blackbox\bin\unins000.exe" -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART' -PassThru
+          if (-not $un.WaitForExit(120000)) { throw "uninstaller timed out" }
+          Start-Sleep 5
+          if (Get-Process bb -ErrorAction SilentlyContinue) { throw "the recorder is still running after uninstall" }
+          if ((Get-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run' -ErrorAction SilentlyContinue).blackbox) { throw "start at login wasn't removed" }
+
+      - uses: actions/upload-artifact@v4
+        if: runner.os == 'Windows'
+        with:
+          name: windows-installer
+          path: |
+            dist/bb-v*-setup-x64.exe
+            dist/bb-v*-setup-x64.exe.sha256
+          if-no-files-found: error
+
   publish:
     name: publish release
     needs: build
@@ -90,12 +133,27 @@ jobs:
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
           path: dist
           merge-multiple: true
       - name: List files
         run: ls -l dist
+
+      - name: Generate winget manifests
+        shell: pwsh
+        run: |
+          $setup = Get-ChildItem dist/bb-v*-setup-x64.exe | Select-Object -First 1
+          $version = ($setup.Name -replace '^bb-v(.+)-setup-x64\.exe$', '$1')
+          $sha = (Get-FileHash $setup.FullName -Algorithm SHA256).Hash
+          ./packaging/winget/generate.ps1 -Version $version -Sha256 $sha -OutDir winget-out
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: winget-manifests
+          path: winget-out
+          if-no-files-found: error
       - uses: softprops/action-gh-release@v2
         with:
           files: dist/*
@@ -103,8 +161,10 @@ jobs:
           body: |
             ## Install (Windows)
 
-            1. Download the `windows-x86_64` zip below and unzip it.
-            2. Run `bb.exe install` in that folder.
-            3. Open a new terminal and run `bb status`.
+            Download **bb-v*-setup-x64.exe** below and run it. No admin rights needed. It puts `bb` on your PATH, starts recording in the background and starts it at every login. Then open a new terminal and run `bb status`.
 
-            `bb install` copies bb onto your PATH, starts recording in the background and starts it at every login. `bb uninstall` reverses it. Check the download against its `.sha256` file if you like.
+            Windows may warn about an unknown publisher because the installer isn't code-signed yet: click **More info**, then **Run anyway**. You can check the download against its `.sha256` file.
+
+            Uninstall from Windows Settings > Apps, or run `bb uninstall`. Your recorded data is kept.
+
+            Prefer a zip? The `windows-x86_64` zip contains `bb.exe`; run `bb.exe install`.

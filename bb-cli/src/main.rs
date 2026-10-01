@@ -273,6 +273,8 @@ fn describe(x: &Sensors) -> Vec<(&'static str, Option<String>)> {
         ("GPU throttling", gpu_throttle),
         ("Disk latency", x.disk_latency_ms.map(|l| format!("{l:.1} ms per request"))),
         ("Disk queue", x.disk_queue.map(|q| format!("{q:.2} requests waiting"))),
+        ("Disk busy", x.disk_busy.map(|b| format!("{b:.0}% of the time"))),
+        ("Memory paging", x.page_out.map(|p| format!("{p:.0} pages/s written out ({:.1} MB/s)", p as f64 * 4.0 / 1024.0))),
     ]
 }
 

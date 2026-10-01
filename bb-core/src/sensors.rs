@@ -207,6 +207,15 @@ pub(crate) fn decikelvin_to_c(v: f64) -> f32 {
     (v / 10.0 - 273.15) as f32
 }
 
+/// The busiest physical disk's percent busy, from "% Idle Time" instances (skipping "_Total").
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn busiest_disk(idle: &[(String, f64)]) -> Option<f32> {
+    idle.iter()
+        .filter(|(name, _)| !name.eq_ignore_ascii_case("_total"))
+        .map(|(_, idle)| (100.0 - *idle as f32).clamp(0.0, 100.0))
+        .fold(None, |m: Option<f32>, b| Some(m.map_or(b, |m| m.max(b))))
+}
+
 /// Takes the busiest engine across GPU adapters from Windows "GPU Engine" counter
 /// instances. Instance names look like
 /// `pid_123_luid_0x0_0x1f_phys_0_eng_0_engtype_3d`; load from all processes on
@@ -353,7 +362,9 @@ mod win {
                 temp_hp: add(r"\Thermal Zone Information(*)\High Precision Temperature"),
                 temp: add(r"\Thermal Zone Information(*)\Temperature"),
                 page_out: add(r"\Memory\Pages Output/sec"),
-                disk_idle: add(r"\PhysicalDisk(_Total)\% Idle Time"),
+                // Every physical disk, so the busiest one counts. "_Total" averages a pinned
+                // disk with an idle one and would hide it.
+                disk_idle: add(r"\PhysicalDisk(*)\% Idle Time"),
                 gpu: GpuProbe::new(),
                 gpu_next: None,
                 ticks: 0,
@@ -375,7 +386,7 @@ mod win {
                     s.disk_latency_ms = self.latency.and_then(value).map(|v| (v * 1000.0) as f32);
                     s.freq_pct = self.freq.and_then(value).map(|v| v as f32);
                     s.page_out = self.page_out.and_then(value).map(|v| v as f32);
-                    s.disk_busy = self.disk_idle.and_then(value).map(|v| (100.0 - v as f32).clamp(0.0, 100.0));
+                    s.disk_busy = self.disk_idle.and_then(|c| busiest_disk(&array(c)));
                     let zones = self
                         .temp_hp
                         .map(array)
@@ -483,6 +494,17 @@ mod tests {
         read_battery_sysfs(Path::new("/definitely/not/here"), &mut s);
         assert_eq!(s, Sensors::default());
         assert_eq!(read_thermal_sysfs(Path::new("/definitely/not/here")), None);
+    }
+
+    #[test]
+    fn busiest_disk_beats_the_average() {
+        let idle = |n: &str, v: f64| (n.to_string(), v);
+        // C: pinned (0% idle), D: idle (100%); "_Total" would say 50% busy.
+        let got = busiest_disk(&[idle("0 C:", 0.0), idle("1 D:", 100.0), idle("_Total", 50.0)]);
+        assert_eq!(got, Some(100.0));
+        assert_eq!(busiest_disk(&[idle("_Total", 10.0)]), None);
+        assert_eq!(busiest_disk(&[]), None);
+        assert_eq!(busiest_disk(&[idle("0 C:", 130.0)]), Some(0.0)); // out-of-range readings are clamped
     }
 
     #[test]

@@ -345,7 +345,9 @@ fn observed(samples: &[Sample]) -> String {
     let mem_max = samples.iter().map(mem).fold(0.0, f32::max);
     let paging = samples.iter().filter_map(|s| s.sensors.page_out).fold(0.0, f32::max);
     let disk = samples.iter().map(|s| s.disk_bps).max().unwrap_or(0) / MB;
-    format!("what it saw: CPU avg {cpu_avg:.0}% (max {cpu_max:.0}%), memory avg {mem_avg:.0}% (max {mem_max:.0}%), paging peak {paging:.0} pages/s, disk peak {disk} MB/s")
+    let busy = samples.iter().filter_map(|s| s.sensors.disk_busy).fold(None, |m: Option<f32>, v| Some(m.map_or(v, |m| m.max(v))));
+    let busy = busy.map_or("n/a".to_string(), |b| format!("{b:.0}%"));
+    format!("what it saw: CPU avg {cpu_avg:.0}% (max {cpu_max:.0}%), memory avg {mem_avg:.0}% (max {mem_max:.0}%), paging peak {paging:.0} pages/s, disk peak {disk} MB/s, disk busy peak {busy}")
 }
 
 // ---- the command --------------------------------------------------------------------

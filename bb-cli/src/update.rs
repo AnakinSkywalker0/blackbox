@@ -345,18 +345,19 @@ mod tests {
     #[test]
     fn picks_the_right_assets() {
         let r = release();
-        let (zip, sha, name) = find_assets(&r, "0.3.0", "windows-x86_64").unwrap();
+        // Pass the extension explicitly so the test means the same on every platform.
+        let (zip, sha, name) = find_assets_as(&r, "0.3.0", "windows-x86_64", "zip").unwrap();
         assert_eq!(name, "bb-v0.3.0-windows-x86_64.zip");
         assert!(zip.ends_with(".zip") && sha.ends_with(".zip.sha256"));
-        assert!(find_assets(&r, "0.3.0", "macos-arm64").is_none());
-        assert!(find_assets(&r, "0.4.0", "windows-x86_64").is_none());
+        assert!(find_assets_as(&r, "0.3.0", "macos-arm64", "zip").is_none());
+        assert!(find_assets_as(&r, "0.4.0", "windows-x86_64", "zip").is_none());
     }
 
     #[test]
     fn a_release_missing_its_checksum_is_refused() {
         let mut r = release();
         r.assets.retain(|a| !a.name.ends_with(".sha256"));
-        assert!(find_assets(&r, "0.3.0", "windows-x86_64").is_none());
+        assert!(find_assets_as(&r, "0.3.0", "windows-x86_64", "zip").is_none());
     }
 
     #[test]

@@ -10,7 +10,7 @@ bb why 15:40
 
 and it answers in plain English with evidence.
 
-> **Status: v0.2.** Records CPU, memory, pagefile, disk throughput and latency, clock speed, temperature, battery/power state, GPU load and the busiest programs, and explains a dozen kinds of slowdown, including short spikes and freezes. See [Limits](#limits-read-this) before trusting it blindly.
+> **Status: v0.4.** Runs on Windows, Linux and macOS, and checks itself: `bb selftest` causes real slowdowns on your machine and verifies that `bb why` names them. Records CPU, memory, pagefile, disk throughput and latency, clock speed, temperature, battery/power state, GPU load and the busiest programs, and explains a dozen kinds of slowdown, including short spikes and freezes. See [Limits](#limits-read-this) before trusting it blindly.
 
 ---
 
@@ -32,6 +32,20 @@ and it answers in plain English with evidence.
 
 ## Install
 
+**One line.** Windows (PowerShell):
+
+```
+irm https://raw.githubusercontent.com/AnakinSkywalker0/blackbox/main/install.ps1 | iex
+```
+
+Linux and macOS:
+
+```
+curl -fsSL https://raw.githubusercontent.com/AnakinSkywalker0/blackbox/main/install.sh | sh
+```
+
+Each script downloads the latest release, checks its SHA-256 against the published checksum, and runs the installer. Read them first if you like: they are short. Or download directly:
+
 **Prebuilt (Windows):** download `bb-v*-setup-x64.exe` from the [Releases page](../../releases) and run it. No admin rights and no Rust needed. It puts `bb` on your PATH, starts recording, and starts it at every login. Uninstall from Windows Settings > Apps. Windows may warn about an unknown publisher because the installer is not code-signed yet: click **More info**, then **Run anyway**.
 
 **Winget** (once the package is accepted into the winget catalog, see [packaging/winget](packaging/winget/README.md)):
@@ -41,7 +55,9 @@ winget install AnakinSkywalker0.blackbox
 winget upgrade AnakinSkywalker0.blackbox
 ```
 
-Each release also ships a plain zip (run `bb.exe install`), a Linux build and `.sha256` checksums.
+Windows always-latest link: `https://github.com/AnakinSkywalker0/blackbox/releases/latest/download/bb-setup-x64.exe`.
+
+**Linux and macOS:** each release has a `.tar.gz` per system (`linux-x86_64`, `macos-arm64`, `macos-x86_64`). Unpack it and run `./bb install`. It copies `bb` to `~/.local/bin`, starts recording, and starts it at login. Each release also ships a plain Windows zip and `.sha256` checksums.
 
 **Or build it from source.** No admin rights are needed to build or run.
 
@@ -181,9 +197,50 @@ Recording restarted.
 
 What it does: downloads the release zip and its SHA-256 checksum from this project's GitHub releases (and nowhere else), refuses to continue if they don't match, runs the new program once to confirm it reports the expected version, then swaps it in and restarts the recorder if one was running. If anything fails, your current version and your recording are left exactly as they were. Your recorded data is kept, and an older database is upgraded in place. A downgrade is not supported, because a database written by a newer version may not open in an older one.
 
-Updating is Windows-only for now. On Linux `bb update` tells you when a newer version exists and where to download it.
+Updating works on Windows, Linux (x86-64) and macOS (Apple Silicon and Intel), using the `.zip` or `.tar.gz` for your system. On other systems `bb update` tells you when a newer version exists and where to download it.
 
 It never runs on its own. Nothing checks for updates in the background.
+
+### `bb selftest`
+
+Causes real slowdowns on your machine and checks that `bb why` names each one. This is how you can check for yourself whether to trust the explanations.
+
+```
+$ bb selftest --memory
+SCENARIO          RANK    WHAT `bb why` SAID
+control     PASS  -       no findings, as it should be
+cpu_hog     PASS  1st     bb.exe (29 processes) was using a large share of the CPU
+cpu_spike   PASS  1st     A short CPU spike around 03:43:31
+disk_heavy  PASS  1st     Heavy disk activity
+memory      PASS  1st     Memory pressure, the machine was short on RAM
+
+Detected 4 of 4 induced slowdowns (4 as the top explanation). False alarms on a quiet machine: 0.
+```
+
+| Scenario | What it does |
+|---|---|
+| `control` | Does nothing for 25 s. Passes only if `bb why` finds nothing (the false-alarm check) |
+| `cpu_hog` | Spins every core for 20 s |
+| `cpu_spike` | Spins every core for 7 s inside a quiet 35 s, so the average hides it |
+| `disk_heavy` | Forced disk writes for 15 s |
+| `memory` | Holds enough memory to reach about 93% full for 20 s. Off by default because it makes the machine sluggish; add `--memory`. It refuses if there isn't enough free memory to do it safely |
+
+Each scenario runs through the real pipeline (sampler, storage, rules) with the load coming from child processes. `RANK` shows whether the right cause was the top explanation. Use `--only cpu_hog,control` to run some. If a recorder is running, its history will contain these test loads, so `bb stop` first for clean history.
+
+What it **can't** cause from software, and so only has synthetic tests: heat throttling, battery and power-mode limits, GPU load or throttling, a slow or failing disk, and machine stalls.
+
+### `bb feedback`
+
+After a `bb why`, say whether it was right:
+
+```
+bb feedback right
+bb feedback wrong --note "it was really the browser"
+bb feedback --summary      # how often each kind of explanation was right
+bb feedback --export       # everything as JSON, to share if you want to help tune the rules
+```
+
+Feedback is stored in your local database only and is never sent anywhere. The verdict counts against the top explanation of that answer. A kind of explanation that is often marked wrong is the one whose threshold needs tuning.
 
 ### `bb start` / `bb stop`
 
@@ -207,7 +264,7 @@ Each finding has a title, evidence, a confidence label (high / medium / low) and
 |---|---|---|
 | **A program hogging the CPU** | One program averaged **25%+** of total CPU | Up to two are reported. Programs with many processes are summed. |
 | **CPU saturated by many programs** | Whole-machine CPU **85%+** and no single hog | Lists the top three contributors. |
-| **Memory pressure / paging** | Memory **90%+** full, or **80%+** with **1 GB+** of pagefile in use | Names the largest memory user. |
+| **Memory pressure** | Memory **90%+** full, or **80%+** full with **1 GB+** of swap in use **and the system actually paging memory out** | Names the largest memory user. Static swap size alone is not blamed: a machine can sit at 80% with swap allocated and be fine. Active paging is measured (Windows `Pages Output/sec`, Linux `pswpout`) and has to be 200+ pages/s for a few seconds. Where that can't be measured, the older memory-plus-swap test applies. |
 | **CPU throttling** | CPU **60%+** busy while it runs at **75% or less** of its rated maximum speed | On Windows the speed is measured (the OS "% of Maximum Frequency" counter). Otherwise it is inferred from the best clock ever recorded. The cause is named when known: **heat** (85 C+), **Battery Saver**, or **battery power limits**, each with advice. |
 | **Battery Saver / low battery** | Battery Saver on for half the window while the CPU was 30%+ busy, or a battery at 15% or less | Low confidence. Windows slows things down in both cases. |
 | **Running very hot** | The hottest system sensor averaged **90 C+** and heat isn't already blamed for throttling | Low confidence. The sensor is a system thermal zone, which may not be the CPU core itself. |
@@ -261,15 +318,16 @@ Most likely causes:
 
 ---
 
-## Run it automatically at login (Windows)
+## Run it automatically at login
 
 blackbox is only useful if it was running *before* the slowdown. One command sets everything up:
 
 ```
-target\release\bb.exe install
+bb.exe install        (Windows)
+./bb install          (Linux and macOS)
 ```
 
-This copies `bb.exe` to `%LOCALAPPDATA%\blackbox\bin`, adds that folder to your PATH, starts recording in the background, and starts recording at every login. No admin rights needed. Open a new terminal afterwards and `bb` works anywhere.
+**Windows:** this copies `bb.exe` to `%LOCALAPPDATA%\blackbox\bin`, adds that folder to your PATH, starts recording in the background, and starts recording at every login. No admin rights needed. Open a new terminal afterwards and `bb` works anywhere.
 
 | Command | What it does |
 |---|---|
@@ -279,6 +337,10 @@ This copies `bb.exe` to `%LOCALAPPDATA%\blackbox\bin`, adds that folder to your 
 | `bb update` | Install a newer release. See [`bb update`](#bb-update) |
 
 Start at login uses the current user's `Run` registry entry, so it works on battery. A console window may flash for a moment at login while the recorder launches.
+
+**Linux:** `bb install` copies `bb` to `~/.local/bin`, writes `~/.config/autostart/blackbox.desktop` (starts at the next desktop login), and starts recording. If `~/.local/bin` isn't on your PATH it tells you what to add. `bb uninstall` removes both. Headless servers have no desktop session to run the autostart entry; start it from your own service or `cron @reboot` with `bb start --quiet`.
+
+**macOS:** `bb install` copies `bb` to `~/.local/bin`, writes a LaunchAgent to `~/Library/LaunchAgents/io.github.anakinskywalker0.blackbox.plist` that starts it at login, and starts recording. `bb uninstall` unloads and removes it.
 
 ---
 
@@ -323,19 +385,20 @@ Thinning returns the space to the OS, so the file shrinks after the first day ra
 
 ## Limits (read this)
 
-blackbox v0.1 is honest about what it can't see. Don't over-trust it.
+blackbox is honest about what it can't see. Don't over-trust it.
 
 - **Sensors vary by machine.** Run `bb sensors` to see what yours exposes. Anything unavailable is skipped, and a slowdown that needs it may come back as "no clear cause".
 - **Temperature is one system sensor,** a thermal zone that Windows exposes without admin rights. On some machines that is not the CPU core, so real CPU heat can be missed. Reading the core temperature needs a kernel driver, which blackbox does not install.
 - **GPU heat and throttle reasons are NVIDIA only** (via the driver's NVML). GPU load works on any vendor on Windows, but AMD and Intel GPUs get no temperature or throttle data yet. Only the first NVIDIA GPU is read.
-- **Battery, temperature, GPU and disk latency are Windows-first.** On Linux, battery and a thermal-zone temperature are read, but CPU speed percent, GPU load and disk latency are not. Those rules just don't fire. The Linux sensor code is covered by tests but has not been run on real Linux hardware.
+- **Windows has the most sensors.** On Linux, battery, a thermal-zone temperature, swap-out rate and NVIDIA GPU load/temperature are read, but CPU speed percent and disk latency are not. On macOS only the basics are read (CPU, memory, disk throughput, programs), with no battery, temperature or GPU data. Rules that need a missing sensor simply don't fire.
+- **Linux and macOS are newer.** They build, pass the tests, install and uninstall, and pass `bb selftest` on GitHub's real runners. The login autostart itself (the desktop entry and LaunchAgent) is created and checked, but has not been exercised by an actual desktop login. There is no macOS or Linux GPU/temperature coverage beyond what is listed above.
 - **Throttling is measured on Windows** (the OS "% of Maximum Frequency" counter). Elsewhere it is inferred from clock speed against the best clock in your own recording, so a brand-new database has a weak baseline. The *cause* (heat, Battery Saver, battery limits) is a best guess from the other sensors.
 - **Only top programs are stored** (top 5 per category per second). A slowdown caused by hundreds of tiny processes may not name a culprit.
 - **Spikes need to last.** CPU bursts shorter than 5 seconds, and disk stalls that don't show up as a long request time, can still be averaged away. Use a shorter `--span`. Samples older than 24 hours are 10 seconds apart, so spike and stall detection only works on recent data.
-- **Thresholds are educated guesses**, not tuned on lots of real machines. Expect some wrong or missing explanations at first.
+- **Thresholds are educated guesses**, not tuned on lots of real machines. Expect some wrong or missing explanations at first. Run `bb selftest` to see how it does on yours, and use `bb feedback` to record when it's wrong.
 - **Updates are checked against GitHub, not signed.** `bb update` verifies the download against the checksum published with the release, which catches corruption and tampering in transit. It does not prove who built the release: that rests on trusting the GitHub account. The Windows executable is not code-signed yet, so SmartScreen may warn on first run.
 - **Without administrator rights**, Windows may hide details for some protected system processes. They can show lower numbers than reality.
-- **Verified so far:** the rule engine, storage, migration and sensor parsing are covered by automated tests (60+). Detection of an induced CPU hog and an induced short CPU burst was checked end to end on Windows, and of a CPU hog on Linux. **Not verified end to end:** heat, GPU throttle and battery causes (the sensors are read correctly, but no real slowdown of those kinds has been induced), and a genuinely slow disk (a fast NVMe never got slow enough to trigger the rule).
+- **Verified so far:** about 90 automated tests, and `bb selftest`, which causes real slowdowns. On a Windows 11 laptop it detected 4 of 4 induced slowdowns (CPU hog, CPU burst, heavy disk, memory pressure), all as the top explanation, with no false alarms. On clean GitHub runners for Windows, Linux and macOS, it detected 3 of 3 (CPU hog, burst, disk). Its first run found a real flaw, a chronic false "memory pressure" on a machine that was merely at 81% with swap allocated, which is now fixed by requiring measured paging. **Not verified end to end:** heat, GPU throttle and battery causes (the sensors are read correctly, but no real slowdown of those kinds has been induced), a genuinely slow disk (a fast NVMe never got slow enough), and machine stalls.
 
 ---
 
@@ -377,6 +440,9 @@ blackbox/
     src/main.rs         commands
     src/install.rs      start/stop, install/uninstall
     src/update.rs       bb update (the only code that uses the network)
+    src/selftest.rs     bb selftest: causes real slowdowns and checks the explanations
+  install.ps1           one-line Windows installer script
+  install.sh            one-line Linux/macOS installer script
   installer/            Inno Setup script for the Windows installer
   packaging/winget/     winget manifest generator and publishing notes
 ```
@@ -404,8 +470,9 @@ cargo test --release -p bb-core size_of -- --ignored --nocapture
 | Version | Planned |
 |---|---|
 | **v0.1** | Recorder, compact storage, `why`/`top`/`status`/`bench`, five causes, automated tests |
-| **v0.2** (now) | Battery and power, temperature, GPU, disk latency, short-spike and stall detection, one-command `install`, background `start`/`stop`, `bb sensors` |
-| **v0.3** | A test suite that *causes* real slowdowns (CPU stress, memory stress, big disk copy, heat) and checks blackbox names them. Aim: report "detected N of M induced slowdowns". AMD/Intel GPU temperature, prebuilt releases, an HTML report |
+| **v0.2** | Battery and power, temperature, GPU, disk latency, short-spike and stall detection, one-command `install`, background `start`/`stop`, `bb sensors` |
+| **v0.4** (now) | `bb selftest` (causes real slowdowns, reports "detected N of M" and false alarms), measured paging for memory pressure, `bb feedback`, Linux and macOS install/update, macOS and Linux CI, one-line install scripts, fixed latest-download links |
+| **Next** | Windows Event Log correlation (driver and update installs, crashes), network and per-program GPU, an HTML report, code signing, winget listing |
 | **Later** | Snapshot installed apps, startup items, drivers and services over time so `why` can say "this got slow right after the 14 Sept driver update" |
 
 ---

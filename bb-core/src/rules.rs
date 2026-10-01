@@ -97,7 +97,28 @@ pub fn kind_of(title: &str) -> &'static str {
 
 /// Advice for programs we recognise, matched case-insensitively.
 pub fn hint_for(program: &str) -> Option<&'static str> {
-    match program.to_lowercase().as_str() {
+    let lower = program.to_lowercase();
+    // Families of helper processes that share a prefix.
+    if lower.starts_with("mdworker") || lower == "mds" || lower == "mds_stores" {
+        return Some("macOS Spotlight indexing. Usually settles on its own, often after an update or a big file change. You can exclude folders in System Settings > Siri & Spotlight.");
+    }
+    if lower.starts_with("tracker-miner") || lower.starts_with("baloo_file") {
+        return Some("Desktop file indexing (GNOME Tracker or KDE Baloo). Usually settles on its own. You can exclude folders in the desktop's search settings.");
+    }
+    match lower.as_str() {
+        "kernel_task" => Some("On a Mac, kernel_task using lots of CPU usually means the system is deliberately slowing things to cool down. Check the fans and vents, and close heavy programs."),
+        "photoanalysisd" | "photolibraryd" => Some("macOS Photos analysing your library in the background. It settles once it has finished."),
+        "backupd" => Some("macOS Time Machine backing up. Usually settles on its own."),
+        "softwareupdated" => Some("macOS is downloading or preparing a software update."),
+        "packagekitd" | "unattended-upgr" | "unattended-upgrades" | "apt" | "apt-get" | "dpkg" => Some("Linux package updates running in the background. They settle when the update finishes."),
+        "updatedb" | "updatedb.mlocate" | "plocate-updatedb" => Some("The file-search database being rebuilt. It runs briefly and settles on its own."),
+        "snapd" => Some("Snap package management working in the background. Usually settles on its own."),
+        _ => hint_for_windows(&lower),
+    }
+}
+
+fn hint_for_windows(lower: &str) -> Option<&'static str> {
+    match lower {
         "msmpeng.exe" => Some(
             "Windows Defender real-time scanning. Add project/build folders under \
              Windows Security > Virus & threat protection > Exclusions.",
@@ -655,6 +676,27 @@ mod tests {
 
     fn titles(f: &[Finding]) -> Vec<&str> {
         f.iter().map(|f| f.title.as_str()).collect()
+    }
+
+    #[test]
+    fn known_background_culprits_get_advice_on_every_platform() {
+        for name in ["mdworker_shared", "mdworker", "mds_stores", "kernel_task", "tracker-miner-fs-3", "baloo_file_extractor", "packagekitd", "MsMpEng.exe", "OneDrive.exe", "vmmem"] {
+            assert!(hint_for(name).is_some(), "no hint for {name}");
+        }
+        assert!(hint_for("chrome.exe").is_none());
+        assert!(hint_for("mdsomething_else").is_none(), "only the real indexer families should match");
+    }
+
+    #[test]
+    fn a_spotlight_hog_carries_its_advice_into_the_finding() {
+        let w = window(|s| {
+            s.cpu_pct = 60.0;
+            s.procs.push(proc("mdworker_shared", 16, 45.0, 2, 0.4));
+        });
+        let f = run(&w);
+        assert_eq!(f.len(), 1);
+        assert!(f[0].title.starts_with("mdworker_shared (16 processes)"));
+        assert!(f[0].hint.as_ref().unwrap().contains("Spotlight"));
     }
 
     #[test]

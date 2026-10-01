@@ -1,0 +1,10 @@
+[package]
+name = "bb-core"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[dependencies]
+chrono = "0.4.45"
+rusqlite = { version = "0.40.2", features = ["bundled"] }
+sysinfo = "0.39.6"

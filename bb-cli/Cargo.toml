@@ -1,0 +1,20 @@
+[package]
+name = "bb-cli"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[[bin]]
+name = "bb"
+path = "src/main.rs"
+
+[dependencies]
+bb-core = { path = "../bb-core" }
+chrono = "0.4.45"
+clap = { version = "4.6.7", features = ["derive"] }
+ctrlc = "3.5.2"
+sysinfo = "0.39.6"
+
+[target."cfg(windows)".dependencies]
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging"] }
+winreg = "0.56.0"

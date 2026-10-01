@@ -152,6 +152,30 @@ $ bb sensors
   Disk queue       0.01 requests waiting
 ```
 
+### `bb update`
+
+Checks GitHub for a newer release and installs it.
+
+```
+$ bb update
+Current version: 0.2.0
+Update available: 0.2.0 -> 0.3.0
+Downloading bb-v0.3.0-windows-x86_64.zip...
+Checksum OK (3641 KB).
+Updated C:\Users\you\AppData\Local\blackbox\bin\bb.exe to 0.3.0.
+Recording restarted.
+```
+
+| Option | Meaning |
+|---|---|
+| `--check` | Only report whether an update exists. Installs nothing |
+
+What it does: downloads the release zip and its SHA-256 checksum from this project's GitHub releases (and nowhere else), refuses to continue if they don't match, runs the new program once to confirm it reports the expected version, then swaps it in and restarts the recorder if one was running. If anything fails, your current version and your recording are left exactly as they were. Your recorded data is kept, and an older database is upgraded in place. A downgrade is not supported, because a database written by a newer version may not open in an older one.
+
+Updating is Windows-only for now. On Linux `bb update` tells you when a newer version exists and where to download it.
+
+It never runs on its own. Nothing checks for updates in the background.
+
 ### `bb start` / `bb stop`
 
 `bb start` records in the background with no terminal (it accepts the same options as `bb run`). `bb stop` stops it. Only one recorder runs per database.
@@ -243,6 +267,7 @@ This copies `bb.exe` to `%LOCALAPPDATA%\blackbox\bin`, adds that folder to your 
 | `bb install` | Set up as above. `--no-autostart` skips start at login |
 | `bb start` / `bb stop` | Record in the background, or stop it |
 | `bb uninstall` | Stop recording, remove start at login and the PATH entry. `--purge` also deletes your data |
+| `bb update` | Install a newer release. See [`bb update`](#bb-update) |
 
 Start at login uses the current user's `Run` registry entry, so it works on battery. A console window may flash for a moment at login while the recorder launches.
 
@@ -281,7 +306,7 @@ Thinning returns the space to the OS, so the file shrinks after the first day ra
 | Windows | `%LOCALAPPDATA%\blackbox\bb.db` |
 | Linux | `$XDG_DATA_HOME/blackbox/bb.db`, or `~/.local/share/blackbox/bb.db` |
 
-- Everything stays on your machine. blackbox makes **no network connections**.
+- Everything stays on your machine. blackbox makes **no network connections**, with one exception: `bb update`, which only runs when you type it. It asks GitHub for the latest release and downloads it. It sends no data about you or your machine (only a `bb/<version>` user agent).
 - It records program **names** and resource numbers. It does not record window titles, file names, keystrokes or screen contents.
 - To erase everything: delete the `bb.db` file (and the `bb.db-wal` / `bb.db-shm` files next to it) while `bb run` is stopped.
 
@@ -299,6 +324,7 @@ blackbox v0.1 is honest about what it can't see. Don't over-trust it.
 - **Only top programs are stored** (top 5 per category per second). A slowdown caused by hundreds of tiny processes may not name a culprit.
 - **Spikes need to last.** CPU bursts shorter than 5 seconds, and disk stalls that don't show up as a long request time, can still be averaged away. Use a shorter `--span`. Samples older than 24 hours are 10 seconds apart, so spike and stall detection only works on recent data.
 - **Thresholds are educated guesses**, not tuned on lots of real machines. Expect some wrong or missing explanations at first.
+- **Updates are checked against GitHub, not signed.** `bb update` verifies the download against the checksum published with the release, which catches corruption and tampering in transit. It does not prove who built the release: that rests on trusting the GitHub account. The Windows executable is not code-signed yet, so SmartScreen may warn on first run.
 - **Without administrator rights**, Windows may hide details for some protected system processes. They can show lower numbers than reality.
 - **Verified so far:** the rule engine, storage, migration and sensor parsing are covered by automated tests (60+). Detection of an induced CPU hog and an induced short CPU burst was checked end to end on Windows, and of a CPU hog on Linux. **Not verified end to end:** heat, GPU throttle and battery causes (the sensors are read correctly, but no real slowdown of those kinds has been induced), and a genuinely slow disk (a fast NVMe never got slow enough to trigger the rule).
 
@@ -341,6 +367,7 @@ blackbox/
   bb-cli/               the `bb` command-line program
     src/main.rs         commands
     src/install.rs      start/stop, install/uninstall
+    src/update.rs       bb update (the only code that uses the network)
 ```
 
 Run the tests:

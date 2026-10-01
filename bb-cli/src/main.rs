@@ -1,4 +1,5 @@
 mod install;
+mod update;
 
 use bb_core::model::{Sample, Sensors, GPU_HW, GPU_POWER, GPU_THERMAL};
 use bb_core::sensors::SensorReader;
@@ -66,6 +67,12 @@ enum Cmd {
         #[arg(long)]
         no_autostart: bool,
     },
+    /// Check GitHub for a newer version and install it (the only command that uses the network)
+    Update {
+        /// Only report whether an update exists; install nothing
+        #[arg(long)]
+        check: bool,
+    },
     /// Undo `install`: stop recording, remove start at login and the PATH entry
     Uninstall {
         /// Also delete all recorded data
@@ -103,6 +110,7 @@ enum Cmd {
 }
 
 fn main() {
+    update::clean_up_old_version();
     let cli = Cli::parse();
     let db = cli.db.unwrap_or_else(default_db_path);
     let result = match cli.cmd {
@@ -111,6 +119,7 @@ fn main() {
         Cmd::Stop => install::stop(&db, false),
         Cmd::Install { no_autostart } => install::install(&db, no_autostart),
         Cmd::Uninstall { purge } => install::uninstall(&db, purge),
+        Cmd::Update { check } => update::run(&db, check),
         Cmd::Top { n, watch } => top(n, watch),
         Cmd::Why { when, span } => why(&db, &when, &span),
         Cmd::Status => status(&db),

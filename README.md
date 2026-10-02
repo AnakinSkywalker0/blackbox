@@ -48,6 +48,16 @@ Each script downloads the latest release, checks its SHA-256 against the publish
 
 **Prebuilt (Windows):** download `bb-v*-setup-x64.exe` from the [Releases page](../../releases) and run it. No admin rights and no Rust needed. It puts `bb` on your PATH, starts recording, and starts it at every login. Uninstall from Windows Settings > Apps. Windows may warn about an unknown publisher because the installer is not code-signed yet: click **More info**, then **Run anyway**.
 
+**Scoop** (works today, no admin rights, no installer window):
+
+```
+scoop bucket add blackbox https://github.com/AnakinSkywalker0/blackbox
+scoop install blackbox/bb
+scoop update bb
+```
+
+Scoop puts `bb` on your PATH but does not register start at login; run `bb start`, or `bb install` for login startup.
+
 **Winget** (once the package is accepted into the winget catalog, see [packaging/winget](packaging/winget/README.md)):
 
 ```

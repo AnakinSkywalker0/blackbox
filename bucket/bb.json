@@ -1,0 +1,29 @@
+{
+    "version": "0.4.1",
+    "description": "A flight recorder for your computer's performance. Ask why it was slow.",
+    "homepage": "https://github.com/AnakinSkywalker0/blackbox",
+    "license": "MIT",
+    "architecture": {
+        "64bit": {
+            "url": "https://github.com/AnakinSkywalker0/blackbox/releases/download/v0.4.1/bb-v0.4.1-windows-x86_64.zip",
+            "hash": "cf0f55f47be90e2e994a4a6f6e56a47770149865acf4d08136a124d552765689",
+            "extract_dir": "bb-v0.4.1-windows-x86_64"
+        }
+    },
+    "bin": "bb.exe",
+    "notes": [
+        "Start recording now with:  bb start",
+        "Scoop does not register start-at-login. For that, run:  bb install  (it copies bb to %LOCALAPPDATA%\\blackbox\\bin).",
+        "Update with:  scoop update bb"
+    ],
+    "checkver": "github",
+    "autoupdate": {
+        "architecture": {
+            "64bit": {
+                "url": "https://github.com/AnakinSkywalker0/blackbox/releases/download/v$version/bb-v$version-windows-x86_64.zip",
+                "hash": { "url": "$url.sha256" },
+                "extract_dir": "bb-v$version-windows-x86_64"
+            }
+        }
+    }
+}

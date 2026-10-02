@@ -1,0 +1,42 @@
+name: Update Scoop bucket
+
+# After a release is published, point bucket/bb.json at it (version, URL and hash).
+# Runs from the Release workflow finishing, because releases created with the default
+# token don't trigger other workflows directly.
+on:
+  workflow_run:
+    workflows: ["Release"]
+    types: [completed]
+
+permissions:
+  contents: write
+
+jobs:
+  update:
+    if: ${{ github.event.workflow_run.conclusion == 'success' && startsWith(github.event.workflow_run.head_branch, 'v') }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+      - name: Update bucket/bb.json
+        env:
+          TAG: ${{ github.event.workflow_run.head_branch }}
+        run: |
+          version="${TAG#v}"
+          zip="bb-v${version}-windows-x86_64.zip"
+          base="https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}"
+          hash=$(curl -fsSL "${base}/${zip}.sha256" | awk '{print $1}')
+          test ${#hash} -eq 64 || { echo "bad checksum for $zip"; exit 1; }
+          jq --arg v "$version" --arg url "${base}/${zip}" --arg h "$hash" --arg dir "bb-v${version}-windows-x86_64" \
+            '.version=$v | .architecture."64bit".url=$url | .architecture."64bit".hash=$h | .architecture."64bit".extract_dir=$dir' \
+            bucket/bb.json > bucket/bb.json.new
+          mv bucket/bb.json.new bucket/bb.json
+          git diff --stat
+      - name: Commit
+        run: |
+          if git diff --quiet; then echo "bucket already up to date"; exit 0; fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -am "Scoop: update bb to ${{ github.event.workflow_run.head_branch }}"
+          git push

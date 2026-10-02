@@ -9,7 +9,9 @@ use bb_core::model::{Finding, Sample};
 use bb_core::rules::{analyze, Thresholds};
 use bb_core::sampler::{raise_priority, Sampler};
 use bb_core::store::Store;
+use std::fs::File;
 use std::io::{Seek, SeekFrom, Write};
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 use sysinfo::System;
@@ -89,9 +91,10 @@ pub fn worker(kind: &str, secs: u64, mb: u64) -> Res {
             Ok(())
         }
         "disk" => {
-            let path = std::env::temp_dir().join(format!("bb-selftest-{}.tmp", std::process::id()));
+            let path = scratch_path(std::process::id());
             let buf = vec![0xA5u8; (32 * MB) as usize];
-            let mut f = std::fs::File::create(&path).map_err(|e| e.to_string())?;
+            // Deleted by the OS when the handle closes, even if this process is killed.
+            let mut f = open_scratch(&path).map_err(|e| e.to_string())?;
             let mut written = 0u64;
             while Instant::now() < end {
                 f.write_all(&buf).map_err(|e| e.to_string())?;
@@ -108,6 +111,55 @@ pub fn worker(kind: &str, secs: u64, mb: u64) -> Res {
         }
         other => Err(format!("unknown worker kind '{other}'")),
     }
+}
+
+/// Where the disk worker with this process id writes. Always `bb-selftest-<digits>.tmp`.
+fn scratch_path(pid: u32) -> PathBuf {
+    std::env::temp_dir().join(format!("bb-selftest-{pid}.tmp"))
+}
+
+/// Opens the scratch file so it cannot outlive the process. The parent kills the worker
+/// when the load phase ends, which would otherwise leave gigabytes behind.
+#[cfg(windows)]
+fn open_scratch(path: &Path) -> std::io::Result<File> {
+    use std::os::windows::fs::OpenOptionsExt;
+    const FILE_FLAG_DELETE_ON_CLOSE: u32 = 0x0400_0000;
+    std::fs::OpenOptions::new().write(true).create(true).truncate(true).custom_flags(FILE_FLAG_DELETE_ON_CLOSE).open(path)
+}
+
+/// On Unix an unlinked file lives until it is closed, and writes still reach the disk.
+#[cfg(unix)]
+fn open_scratch(path: &Path) -> std::io::Result<File> {
+    let f = File::create(path)?;
+    let _ = std::fs::remove_file(path);
+    Ok(f)
+}
+
+/// True for names this program creates: `bb-selftest-` + digits + `.tmp`, and nothing else.
+fn is_scratch_name(name: &str) -> bool {
+    name.strip_prefix("bb-selftest-")
+        .and_then(|rest| rest.strip_suffix(".tmp"))
+        .is_some_and(|digits| !digits.is_empty() && digits.chars().all(|c| c.is_ascii_digit()))
+}
+
+/// Deletes scratch files left behind by earlier (killed or crashed) runs. Only files older
+/// than `min_age` are touched, so a run in progress is never disturbed. Returns how many
+/// bytes were freed.
+fn sweep_stale_scratch(dir: &Path, min_age: Duration) -> u64 {
+    let Ok(entries) = std::fs::read_dir(dir) else { return 0 };
+    let mut freed = 0;
+    for e in entries.flatten() {
+        let name = e.file_name();
+        if !is_scratch_name(&name.to_string_lossy()) {
+            continue;
+        }
+        let Ok(meta) = e.metadata() else { continue };
+        let old_enough = meta.modified().ok().and_then(|m| m.elapsed().ok()).is_some_and(|age| age >= min_age);
+        if meta.is_file() && old_enough && std::fs::remove_file(e.path()).is_ok() {
+            freed += meta.len();
+        }
+    }
+    freed
 }
 
 fn spawn_workers(plan: &[(&'static str, usize, u64)], secs: u64) -> Vec<Child> {
@@ -136,8 +188,11 @@ fn spawn_workers(plan: &[(&'static str, usize, u64)], secs: u64) -> Vec<Child> {
 
 fn stop_workers(kids: &mut Vec<Child>) {
     for k in kids.iter_mut() {
+        let id = k.id();
         let _ = k.kill();
         let _ = k.wait();
+        // Belt and braces: the worker's scratch file is normally already gone.
+        let _ = std::fs::remove_file(scratch_path(id));
     }
     kids.clear();
 }
@@ -354,6 +409,11 @@ fn observed(samples: &[Sample]) -> String {
 
 pub fn run(only: &[String], include_memory: bool, recorder_running: bool) -> Res {
     raise_priority();
+    // Earlier versions left up to 2 GB per run in the temp folder. Clear those out.
+    let freed = sweep_stale_scratch(&std::env::temp_dir(), Duration::from_secs(600));
+    if freed > 0 {
+        println!("Cleaned up {} MB of scratch files left by earlier selftest runs.", freed / MB);
+    }
     let cores = std::thread::available_parallelism().map_or(2, |n| n.get());
     println!("blackbox selftest: causing real slowdowns and checking that `bb why` names them.");
     println!("The machine will be busy for a few minutes. Close heavy programs first for a cleaner result.");
@@ -427,4 +487,63 @@ pub fn run(only: &[String], include_memory: bool, recorder_running: bool) -> Res
         return Err(format!("{failed} scenario(s) failed"));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_dir(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("bb-selftest-unit-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[test]
+    fn scratch_names_are_matched_strictly() {
+        assert!(is_scratch_name("bb-selftest-123.tmp"));
+        assert!(is_scratch_name("bb-selftest-9.tmp"));
+        assert!(!is_scratch_name("bb-selftest-.tmp"));
+        assert!(!is_scratch_name("bb-selftest-12a.tmp"));
+        assert!(!is_scratch_name("bb-selftest-123.txt"));
+        assert!(!is_scratch_name("notes-bb-selftest-123.tmp"));
+        assert!(!is_scratch_name("bb.db"));
+        assert!(!is_scratch_name("bb-selftest-123.tmp.bak"));
+    }
+
+    #[test]
+    fn a_scratch_file_disappears_when_its_handle_closes() {
+        let d = temp_dir("handle");
+        let path = d.join("bb-selftest-1.tmp");
+        {
+            let mut f = open_scratch(&path).unwrap();
+            f.write_all(&[7u8; 4096]).unwrap();
+            f.sync_data().unwrap();
+        } // closed here, as happens when the process is killed
+        assert!(!path.exists(), "the scratch file should be gone once closed");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn sweep_removes_only_old_scratch_files() {
+        let d = temp_dir("sweep");
+        let old = d.join("bb-selftest-111.tmp");
+        let fresh = d.join("bb-selftest-222.tmp");
+        let other = d.join("keep-me.tmp");
+        let lookalike = d.join("bb-selftest-333.txt");
+        for p in [&old, &fresh, &other, &lookalike] {
+            std::fs::write(p, vec![1u8; 1000]).unwrap();
+        }
+        // Make one scratch file look an hour old.
+        let hour_ago = std::time::SystemTime::now() - Duration::from_secs(3600);
+        std::fs::OpenOptions::new().write(true).open(&old).unwrap().set_modified(hour_ago).unwrap();
+
+        let freed = sweep_stale_scratch(&d, Duration::from_secs(600));
+        assert_eq!(freed, 1000);
+        assert!(!old.exists(), "an old scratch file should be removed");
+        assert!(fresh.exists(), "a recent one may belong to a run in progress");
+        assert!(other.exists() && lookalike.exists(), "files with other names are never touched");
+        let _ = std::fs::remove_dir_all(&d);
+    }
 }

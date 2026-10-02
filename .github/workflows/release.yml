@@ -116,27 +116,49 @@ jobs:
           "$hash  $name" | Set-Content "dist\$name.sha256" -Encoding ascii
           "INSTALLER_VERSION=$version" | Add-Content $env:GITHUB_ENV
 
-      - name: Smoke test the installer (install, run, uninstall)
+      - name: Smoke test the installer (install, run, upgrade, uninstall)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          $setup = "dist\bb-v$env:INSTALLER_VERSION-setup-x64.exe"
-          $bb = "$env:LOCALAPPDATA\blackbox\bin\bb.exe"
-          $p = Start-Process $setup -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART' -PassThru
-          if (-not $p.WaitForExit(120000)) { throw "installer timed out" }
-          if ($p.ExitCode -ne 0) { throw "installer exit code $($p.ExitCode)" }
-          Start-Sleep 5
+          $setup = (Resolve-Path "dist\bb-v$env:INSTALLER_VERSION-setup-x64.exe").Path
+          $dir = "$env:LOCALAPPDATA\blackbox\bin"
+          $bb = "$dir\bb.exe"
+          $silent = '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART'
+          $runKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
+
+          # 1. Fresh silent install under a harness that waits for the installer AND everything it
+          #    started. Winget's validation works this way and reports "failed to install without
+          #    user input" if anything is left running, so a fresh install must not start the recorder.
+          $job = Start-Job -ScriptBlock { param($f, $a) Start-Process $f -ArgumentList $a -Wait } -ArgumentList $setup, $silent
+          if (-not (Wait-Job $job -Timeout 120)) { throw "the installer left a background process running, so automated installers would wait forever" }
+          Start-Sleep 2
           $said = (& $bb --version).Trim()
           if ($said -ne "bb $env:INSTALLER_VERSION") { throw "installed program says '$said'" }
+          if (Get-Process bb -ErrorAction SilentlyContinue) { throw "a fresh silent install must not start the recorder" }
+          if (-not (Get-ItemProperty $runKey).blackbox) { throw "start at login wasn't registered" }
+
+          # 2. Recording works once started.
+          & $bb start --quiet
+          Start-Sleep 5
           & $bb status
-          if (-not (Get-Process bb -ErrorAction SilentlyContinue)) { throw "the recorder isn't running after install" }
-          if (-not (Get-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run').blackbox) { throw "start at login wasn't registered" }
-          $un = Start-Process "$env:LOCALAPPDATA\blackbox\bin\unins000.exe" -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART' -PassThru
-          if (-not $un.WaitForExit(120000)) { throw "uninstaller timed out" }
+          if (-not (Get-Process bb -ErrorAction SilentlyContinue)) { throw "the recorder didn't start" }
+
+          # 3. Upgrading over a running recorder must bring the recorder back as a new process.
+          $before = @((Get-Process bb).Id)
+          $p = Start-Process $setup -ArgumentList $silent -PassThru
+          if (-not $p.WaitForExit(120000)) { throw "the upgrade timed out" }
+          if ($p.ExitCode -ne 0) { throw "the upgrade exited with code $($p.ExitCode)" }
+          Start-Sleep 5
+          $after = @((Get-Process bb -ErrorAction SilentlyContinue).Id)
+          if ($after.Count -eq 0) { throw "the recorder wasn't restarted after an upgrade" }
+          if ($before | Where-Object { $after -contains $_ }) { throw "expected a new recorder process after the upgrade" }
+
+          # 4. Uninstalling stops the recorder and removes start at login.
+          $un = Start-Process "$dir\unins000.exe" -ArgumentList $silent -PassThru
+          if (-not $un.WaitForExit(120000)) { throw "the uninstaller timed out" }
           Start-Sleep 5
           if (Get-Process bb -ErrorAction SilentlyContinue) { throw "the recorder is still running after uninstall" }
-          if ((Get-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run' -ErrorAction SilentlyContinue).blackbox) { throw "start at login wasn't removed" }
-
+          if ((Get-ItemProperty $runKey -ErrorAction SilentlyContinue).blackbox) { throw "start at login wasn't removed" }
       - uses: actions/upload-artifact@v4
         if: runner.os == 'Windows'
         with:

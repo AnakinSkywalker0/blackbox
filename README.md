@@ -55,6 +55,8 @@ winget install AnakinSkywalker0.blackbox
 winget upgrade AnakinSkywalker0.blackbox
 ```
 
+**Silent installs** (winget, scripts, `/VERYSILENT`) put `bb` on your PATH and register start at login, but do **not** start recording straight away. A fresh silent install must not leave a background process behind, or automated installers wait for it forever. Recording starts at your next login, or run `bb start`. The interactive installer offers a "Start recording now" checkbox, and the one-line script starts it for you. Upgrading restarts the recorder if it was running.
+
 Windows always-latest link: `https://github.com/AnakinSkywalker0/blackbox/releases/latest/download/bb-setup-x64.exe`.
 
 **Linux and macOS:** each release has a `.tar.gz` per system (`linux-x86_64`, `macos-arm64`, `macos-x86_64`). Unpack it and run `./bb install`. It copies `bb` to `~/.local/bin`, starts recording, and starts it at login. Each release also ships a plain Windows zip and `.sha256` checksums.
@@ -334,7 +336,7 @@ bb.exe install        (Windows)
 
 | Command | What it does |
 |---|---|
-| `bb install` | Set up as above. `--no-autostart` skips start at login |
+| `bb install` | Set up as above. `--no-autostart` skips start at login. `--no-start` leaves recording off until the next login (what the installer uses) |
 | `bb start` / `bb stop` | Record in the background, or stop it |
 | `bb uninstall` | Stop recording, remove start at login and the PATH entry. `--purge` also deletes your data |
 | `bb update` | Install a newer release. See [`bb update`](#bb-update) |

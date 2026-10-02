@@ -46,6 +46,11 @@ classic personal access token with `public_repo` stored as the repo secret `WING
 
 ## Notes
 
+- **A silent install must not leave a background process running.** Microsoft's validation waits
+  for everything the installer started, and fails with "failed to install without user input" if
+  anything is still running. The installer therefore never starts the recorder on a fresh silent
+  install (it starts at the next login, or with `bb start`). The release workflow tests this with
+  a harness that waits for the whole process tree. Version 0.3.0 had this bug.
 - Never change `AppId` in `installer/blackbox.iss`. Winget and Windows match upgrades on it
   (the manifest's `ProductCode` is that GUID plus `_is1`).
 - `bb update` can replace the installed `bb.exe` with a newer version without winget knowing.

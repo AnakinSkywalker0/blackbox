@@ -75,7 +75,8 @@ Description: |-
   temperature, battery and the busiest programs). When something felt slow, 'bb why 15:40'
   explains the likely cause in plain English, with evidence. Everything stays on your
   machine and nothing is sent anywhere. The only network use is 'bb update', which runs
-  only when you type it.
+  only when you type it. After installing with winget, run 'bb start' (or sign out and back
+  in) to begin recording; a silent install never starts the recorder itself.
 Moniker: blackbox
 Tags:
 - performance

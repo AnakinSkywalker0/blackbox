@@ -28,6 +28,11 @@ try {
     $p.WaitForExit()
     if ($p.ExitCode -ne 0) { throw "The installer exited with code $($p.ExitCode)." }
 
+    # A silent install never starts the recorder (so automated installers don't hang waiting
+    # for it). Start it here, as a child of this script rather than of the installer.
+    $bb = Join-Path $env:LOCALAPPDATA 'blackbox\bin\bb.exe'
+    if (-not (Get-Process -Name bb -ErrorAction SilentlyContinue)) { & $bb start --quiet }
+
     Write-Host ''
     Write-Host 'blackbox is installed and recording. Open a NEW terminal and run:  bb status'
     Write-Host 'When something feels slow:  bb why "10m ago"'

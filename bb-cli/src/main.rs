@@ -67,6 +67,10 @@ enum Cmd {
         /// Don't start recording automatically at login
         #[arg(long)]
         no_autostart: bool,
+        /// Don't start recording right now (it still starts at login). Installers use this so
+        /// they never leave a background process behind
+        #[arg(long)]
+        no_start: bool,
     },
     /// Check GitHub for a newer version and install it (the only command that uses the network)
     Update {
@@ -149,7 +153,7 @@ fn main() {
         Cmd::Run(o) => run(&db, o.interval, o.retention_days, o.top_n),
         Cmd::Start { opts, quiet } => install::start(&db, &opts.to_args(), quiet),
         Cmd::Stop => install::stop(&db, false),
-        Cmd::Install { no_autostart } => install::install(&db, no_autostart),
+        Cmd::Install { no_autostart, no_start } => install::install(&db, no_autostart, !no_start),
         Cmd::Uninstall { purge } => install::uninstall(&db, purge),
         Cmd::Update { check } => update::run(&db, check),
         Cmd::Top { n, watch } => top(n, watch),

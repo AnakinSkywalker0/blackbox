@@ -237,7 +237,7 @@ mod win {
 }
 
 #[cfg(windows)]
-pub fn install(db: &Path, no_autostart: bool) -> Res {
+pub fn install(db: &Path, no_autostart: bool, start_now: bool) -> Res {
     let dir = install_dir();
     let dest = dir.join("bb.exe");
     let me = std::env::current_exe().map_err(|e| e.to_string())?;
@@ -260,12 +260,17 @@ pub fn install(db: &Path, no_autostart: bool) -> Res {
         win::set_autostart(&dest)?;
         println!("Start at login:   on");
     }
-    // Start from the installed copy so the original can be deleted.
-    let status = Command::new(&dest).arg("--db").arg(db).args(["start"]).status().map_err(|e| e.to_string())?;
-    if !status.success() {
-        return Err("installed, but the recorder failed to start".into());
+    if start_now {
+        // Start from the installed copy so the original can be deleted.
+        let status = Command::new(&dest).arg("--db").arg(db).args(["start"]).status().map_err(|e| e.to_string())?;
+        if !status.success() {
+            return Err("installed, but the recorder failed to start".into());
+        }
+        println!("\nDone. Try `bb status` in a new terminal, and `bb why \"10m ago\"` when something feels slow.");
+    } else {
+        println!("Recording:        not started now. It starts at your next login, or run `bb start`.");
+        println!("\nDone.");
     }
-    println!("\nDone. Try `bb status` in a new terminal, and `bb why \"10m ago\"` when something feels slow.");
     Ok(())
 }
 
@@ -362,7 +367,7 @@ fn launchctl(verb: &str, plist: &Path) {
 }
 
 #[cfg(unix)]
-pub fn install(db: &Path, no_autostart: bool) -> Res {
+pub fn install(db: &Path, no_autostart: bool, start_now: bool) -> Res {
     use std::os::unix::fs::PermissionsExt;
     let home = home()?;
     let dir = install_dir();
@@ -400,11 +405,16 @@ pub fn install(db: &Path, no_autostart: bool) -> Res {
         launchctl("bootstrap", &file);
         println!("Start at login:   on ({})", file.display());
     }
-    let status = Command::new(&dest).arg("--db").arg(db).arg("start").status().map_err(|e| e.to_string())?;
-    if !status.success() {
-        return Err("installed, but the recorder failed to start".into());
+    if start_now {
+        let status = Command::new(&dest).arg("--db").arg(db).arg("start").status().map_err(|e| e.to_string())?;
+        if !status.success() {
+            return Err("installed, but the recorder failed to start".into());
+        }
+        println!("\nDone. Try `bb status`, and `bb why \"10m ago\"` when something feels slow.");
+    } else {
+        println!("Recording:        not started now. It starts at your next login, or run `bb start`.");
+        println!("\nDone.");
     }
-    println!("\nDone. Try `bb status`, and `bb why \"10m ago\"` when something feels slow.");
     Ok(())
 }
 
@@ -437,7 +447,7 @@ pub fn uninstall(db: &Path, purge: bool) -> Res {
 }
 
 #[cfg(not(any(windows, unix)))]
-pub fn install(_db: &Path, _no_autostart: bool) -> Res {
+pub fn install(_db: &Path, _no_autostart: bool, _start_now: bool) -> Res {
     Err("`install` isn't supported on this platform. Copy bb onto your PATH and run `bb start`.".into())
 }
 

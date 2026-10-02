@@ -29,6 +29,16 @@ jobs:
       - name: Release build
         run: cargo build --release --locked
 
+      # bb.exe must not need the Visual C++ runtime DLL: a clean Windows install doesn't have it,
+      # and the installer runs bb.exe (see .cargo/config.toml).
+      - name: Check bb.exe has no Visual C++ runtime dependency
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          if (Select-String -Path target/release/bb.exe -Pattern 'VCRUNTIME140' -Quiet) {
+            throw "bb.exe imports VCRUNTIME140.dll. Keep crt-static on (see .cargo/config.toml)."
+          }
+          Write-Host "OK: no Visual C++ runtime dependency"
       # Install, run, and uninstall for real (in a throwaway HOME) on Linux and macOS.
       - name: Install and uninstall smoke test
         if: runner.os != 'Windows'

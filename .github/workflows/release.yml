@@ -71,6 +71,14 @@ jobs:
       - name: Build
         run: cargo build --release --locked -p bb-cli ${{ matrix.target && format('--target {0}', matrix.target) || '' }}
 
+      - name: Check bb.exe has no Visual C++ runtime dependency
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          if (Select-String -Path ${{ matrix.bindir }}/bb.exe -Pattern 'VCRUNTIME140' -Quiet) {
+            throw "bb.exe imports VCRUNTIME140.dll. A clean Windows install lacks it and the installer would hang. Keep crt-static on (.cargo/config.toml)."
+          }
+
       - name: Package
         id: pack
         run: |

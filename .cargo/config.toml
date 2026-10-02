@@ -1,0 +1,7 @@
+# Link the C runtime statically on Windows. Without this, bb.exe needs VCRUNTIME140.dll
+# (the Visual C++ Redistributable), which a clean Windows install does not have. The
+# installer runs bb.exe, so on such a machine Windows shows a "DLL not found" dialog and
+# the install hangs waiting for a click. That is exactly what made winget's automated
+# install test time out.
+[target.'cfg(all(windows, target_env = "msvc"))']
+rustflags = ["-C", "target-feature=+crt-static"]

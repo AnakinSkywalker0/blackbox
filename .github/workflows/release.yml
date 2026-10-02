@@ -135,7 +135,11 @@ jobs:
           $said = (& $bb --version).Trim()
           if ($said -ne "bb $env:INSTALLER_VERSION") { throw "installed program says '$said'" }
           if (Get-Process bb -ErrorAction SilentlyContinue) { throw "a fresh silent install must not start the recorder" }
-          if (-not (Get-ItemProperty $runKey).blackbox) { throw "start at login wasn't registered" }
+          if (-not (Get-ItemProperty $runKey -ErrorAction SilentlyContinue).blackbox) {
+            Write-Host "start at login is missing. Running bb install --no-start by hand to show why:"
+            & $bb install --no-start
+            throw "start at login wasn't registered"
+          }
 
           # 2. Recording works once started.
           & $bb start --quiet

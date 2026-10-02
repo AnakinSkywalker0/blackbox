@@ -226,13 +226,39 @@ mod win {
     }
 
     pub fn set_autostart(exe: &Path) -> Res {
-        open(RUN_KEY)?
-            .set_value(RUN_NAME, &format!("\"{}\" start --quiet", exe.display()))
-            .map_err(|e| format!("couldn't set up start at login: {e}"))
+        set_run_value(RUN_KEY, RUN_NAME, &format!("\"{}\" start --quiet", exe.display()))
     }
 
     pub fn clear_autostart() -> Result<bool, String> {
-        Ok(open(RUN_KEY)?.delete_value(RUN_NAME).is_ok())
+        clear_run_value(RUN_KEY, RUN_NAME)
+    }
+
+    /// Writes a value under `key_path`, creating the key if it doesn't exist. A fresh Windows
+    /// account may not have a Run key yet, and opening a missing key fails.
+    pub fn set_run_value(key_path: &str, name: &str, value: &str) -> Res {
+        let (key, _) = RegKey::predef(HKEY_CURRENT_USER)
+            .create_subkey_with_flags(key_path, KEY_WRITE)
+            .map_err(|e| format!("couldn't open {key_path} to set up start at login: {e}"))?;
+        key.set_value(name, &value).map_err(|e| format!("couldn't set up start at login: {e}"))
+    }
+
+    /// Removes a value. A key or value that isn't there is not an error: there is nothing to remove.
+    pub fn clear_run_value(key_path: &str, name: &str) -> Result<bool, String> {
+        match RegKey::predef(HKEY_CURRENT_USER).open_subkey_with_flags(key_path, KEY_WRITE) {
+            Ok(key) => Ok(key.delete_value(name).is_ok()),
+            Err(_) => Ok(false),
+        }
+    }
+
+    /// Deletes a whole key tree. Only used by tests, on keys they created.
+    #[cfg(test)]
+    pub fn delete_tree(key_path: &str) {
+        let _ = RegKey::predef(HKEY_CURRENT_USER).delete_subkey_all(key_path);
+    }
+
+    #[cfg(test)]
+    pub fn read_value(key_path: &str, name: &str) -> Option<String> {
+        RegKey::predef(HKEY_CURRENT_USER).open_subkey(key_path).ok()?.get_value::<String, _>(name).ok()
     }
 }
 
@@ -461,6 +487,29 @@ mod tests {
     use super::*;
 
     const DIR: &str = r"C:\Users\me\AppData\Local\blackbox\bin";
+
+    /// A fresh Windows account may have no Run key. Registering and removing start at login
+    /// must work anyway. Uses a throwaway key, never the real Run key.
+    #[cfg(windows)]
+    #[test]
+    fn autostart_creates_a_missing_key_and_tolerates_removing_a_missing_one() {
+        let root = format!(r"Software\blackbox-test-{}", std::process::id());
+        let key = format!(r"{root}\Run");
+        win::delete_tree(&root);
+
+        // Nothing there yet: removing is not an error and reports nothing removed.
+        assert_eq!(win::clear_run_value(&key, "blackbox").unwrap(), false);
+        // Setting creates the missing key.
+        win::set_run_value(&key, "blackbox", r#""C:\x\bb.exe" start --quiet"#).unwrap();
+        assert_eq!(win::read_value(&key, "blackbox").as_deref(), Some(r#""C:\x\bb.exe" start --quiet"#));
+        // Setting again overwrites; removing works, then reports nothing left.
+        win::set_run_value(&key, "blackbox", "second").unwrap();
+        assert_eq!(win::read_value(&key, "blackbox").as_deref(), Some("second"));
+        assert_eq!(win::clear_run_value(&key, "blackbox").unwrap(), true);
+        assert_eq!(win::clear_run_value(&key, "blackbox").unwrap(), false);
+
+        win::delete_tree(&root);
+    }
 
     #[test]
     fn linux_autostart_entry_is_valid() {

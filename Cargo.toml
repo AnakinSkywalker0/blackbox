@@ -1,5 +1,5 @@
 [workspace]
-members = ["bb-core", "bb-cli"]
+members = ["bb-core", "bb-cli", "bb-gui"]
 resolver = "2"
 
 [profile.release]

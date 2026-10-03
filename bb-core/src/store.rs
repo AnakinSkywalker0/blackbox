@@ -198,6 +198,16 @@ impl Store {
 
     /// All samples with `from <= ts <= to`, oldest first, with their programs.
     pub fn window(&self, from: i64, to: i64) -> rusqlite::Result<Vec<Sample>> {
+        self.load(from, to, true)
+    }
+
+    /// Like `window`, but without the per-program rows. Much cheaper for long ranges that
+    /// are only being charted; the rule engine can't name a culprit from these.
+    pub fn window_light(&self, from: i64, to: i64) -> rusqlite::Result<Vec<Sample>> {
+        self.load(from, to, false)
+    }
+
+    fn load(&self, from: i64, to: i64, with_procs: bool) -> rusqlite::Result<Vec<Sample>> {
         const MIB: u64 = 1024 * 1024;
         let mut st = self.conn.prepare_cached(
             "SELECT ts,cpu,mem_used,mem_total,swap_used,mhz,disk,
@@ -232,6 +242,9 @@ impl Store {
                 })
             })?
             .collect::<Result<_, _>>()?;
+        if !with_procs {
+            return Ok(out);
+        }
 
         let mut ps = self.conn.prepare_cached(
             "SELECT ts,name,n,cpu,disk,mem FROM procs WHERE ts BETWEEN ?1 AND ?2 ORDER BY ts",
@@ -396,6 +409,18 @@ mod tests {
         assert_eq!(s.best_mhz().unwrap(), 3200);
         let st = s.stats().unwrap();
         assert_eq!((st.samples, st.first_ts, st.last_ts), (2, Some(1000), Some(1001)));
+    }
+
+    #[test]
+    fn light_window_has_samples_but_no_programs() {
+        let mut s = Store::open_in_memory().unwrap();
+        s.insert(&sample(10)).unwrap();
+        let light = s.window_light(10, 10).unwrap();
+        let full = s.window(10, 10).unwrap();
+        assert_eq!(light.len(), 1);
+        assert!(light[0].procs.is_empty());
+        assert_eq!(full[0].procs.len(), 1);
+        assert_eq!((light[0].cpu_pct, light[0].sensors.clone()), (full[0].cpu_pct, full[0].sensors.clone()));
     }
 
     #[test]

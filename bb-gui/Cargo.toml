@@ -1,0 +1,17 @@
+[package]
+name = "bb-gui"
+version = "0.4.2"
+edition = "2021"
+license = "MIT"
+description = "Desktop window for blackbox: timeline charts and plain-English explanations"
+
+[[bin]]
+name = "bb-gui"
+path = "src/main.rs"
+
+[dependencies]
+bb-core = { path = "../bb-core" }
+chrono = "0.4.45"
+eframe = "0.36.2"
+egui_plot = "0.37.0"
+sysinfo = "0.39.6"

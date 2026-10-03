@@ -2,7 +2,7 @@ mod install;
 mod selftest;
 mod update;
 
-use bb_core::model::{Sample, Sensors, GPU_HW, GPU_POWER, GPU_THERMAL};
+use bb_core::model::{describe_sensors as describe, Sample};
 use bb_core::sensors::SensorReader;
 use bb_core::rules::{analyze, Thresholds};
 use bb_core::sampler::Sampler;
@@ -249,37 +249,6 @@ fn run(db: &std::path::Path, interval: u64, retention_days: u32, top_n: usize) -
     let _ = store.compact();
     println!("Stopped after {count} samples.");
     Ok(())
-}
-
-/// One line per sensor: its label and reading, or None when unavailable.
-fn describe(x: &Sensors) -> Vec<(&'static str, Option<String>)> {
-    let power = x.on_ac.map(|ac| {
-        let state = if ac { "plugged in" } else { "on battery" };
-        let saver = if x.battery_saver == Some(true) { ", Battery Saver on" } else { "" };
-        match x.battery_pct {
-            Some(b) => format!("{b}%, {state}{saver}"),
-            None => format!("{state}{saver}"),
-        }
-    });
-    let gpu_throttle = x.gpu_throttle.map(|g| {
-        let mut why = Vec::new();
-        if g & GPU_THERMAL != 0 { why.push("heat"); }
-        if g & GPU_POWER != 0 { why.push("power cap"); }
-        if g & GPU_HW != 0 { why.push("hardware slowdown"); }
-        if why.is_empty() { "none".to_string() } else { why.join(", ") }
-    });
-    vec![
-        ("Battery / power", power),
-        ("Temperature", x.temp_c.map(|c| format!("{c:.0} C (hottest system sensor)"))),
-        ("CPU speed", x.freq_pct.map(|f| format!("{f:.0}% of rated maximum"))),
-        ("GPU load", x.gpu_pct.map(|g| format!("{g:.0}%"))),
-        ("GPU temperature", x.gpu_temp_c.map(|c| format!("{c:.0} C"))),
-        ("GPU throttling", gpu_throttle),
-        ("Disk latency", x.disk_latency_ms.map(|l| format!("{l:.1} ms per request"))),
-        ("Disk queue", x.disk_queue.map(|q| format!("{q:.2} requests waiting"))),
-        ("Disk busy", x.disk_busy.map(|b| format!("{b:.0}% of the time"))),
-        ("Memory paging", x.page_out.map(|p| format!("{p:.0} pages/s written out ({:.1} MB/s)", p as f64 * 4.0 / 1024.0))),
-    ]
 }
 
 fn sensors() -> Res {

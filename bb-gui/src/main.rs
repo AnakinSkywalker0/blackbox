@@ -14,7 +14,7 @@ use bb_core::timeparse::{parse_duration, parse_when};
 use chrono::Local;
 use eframe::egui::{self, Color32, RichText, Stroke};
 use egui_plot::{HoverPosition, Line, Plot, PlotPoints, Polygon};
-use logic::{axis_label, clock, downsample, find_bb, find_moments, recorder_pid, run_bb, split_at_gaps, Moment, Point, Range};
+use logic::{axis_label, clock, downsample, find_bb, find_moments, heat_summary, recorder_pid, run_bb, split_at_gaps, HeatSummary, Moment, Point, Range};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::time::{Duration, Instant};
@@ -35,6 +35,7 @@ struct Loaded {
     range: Range,
     points: Vec<Point>,
     moments: Vec<Moment>,
+    heat: HeatSummary,
     latest: Option<Sample>,
     count: u64,
     first: Option<i64>,
@@ -66,7 +67,7 @@ fn spawn_worker(db: PathBuf, ctx: egui::Context) -> (Sender<Request>, Receiver<L
 
 fn load(db: &Path, req: &Request, cache: &mut Option<(Range, i64, Vec<Moment>)>) -> Loaded {
     let now = Local::now().timestamp();
-    let empty = |error: Option<String>| Loaded { range: req.range, points: vec![], moments: vec![], latest: None, count: 0, first: None, last: None, now, error };
+    let empty = |error: Option<String>| Loaded { range: req.range, points: vec![], moments: vec![], heat: HeatSummary::default(), latest: None, count: 0, first: None, last: None, now, error };
     let store = match Store::open(db) {
         Ok(s) => s,
         Err(e) => return empty(Some(format!("can't open the database: {e}"))),
@@ -90,6 +91,7 @@ fn load(db: &Path, req: &Request, cache: &mut Option<(Range, i64, Vec<Moment>)>)
         range: req.range,
         points: downsample(&light, 1200),
         moments,
+        heat: heat_summary(&light),
         latest: light.last().cloned(),
         count: stats.map_or(0, |s| s.samples),
         first: stats.and_then(|s| s.first_ts),
@@ -127,6 +129,7 @@ fn explain(db: &Path, from: i64, to: i64) -> Result<Explained, String> {
 enum Tab {
     Timeline,
     Why,
+    Thermal,
     Sensors,
     About,
 }
@@ -542,6 +545,81 @@ fn why(app: &mut App, ui: &mut egui::Ui, actions: &mut Vec<Action>) {
     });
 }
 
+fn thermal(app: &App, ui: &mut egui::Ui, actions: &mut Vec<Action>) {
+    ui.horizontal(|ui| {
+        for r in Range::ALL {
+            if ui.selectable_label(app.range == r, r.label()).clicked() {
+                actions.push(Action::SetRange(r));
+            }
+        }
+        if app.loading {
+            ui.add_space(12.0);
+            ui.spinner();
+        }
+    });
+    let Some(d) = &app.data else {
+        ui.add_space(20.0);
+        ui.label("Loading...");
+        return;
+    };
+    if let Some(e) = &d.error {
+        ui.colored_label(RED, e);
+        return;
+    }
+    let h = &d.heat;
+    let (level, text) = h.verdict();
+    let color = match level {
+        "bad" => RED,
+        "warn" => ORANGE,
+        "good" => GREEN,
+        _ => MUTED,
+    };
+    ui.add_space(4.0);
+    egui::Frame::group(ui.style()).show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        ui.label(RichText::new(text).color(color).size(16.0).strong());
+    });
+    if h.peak_c.is_none() {
+        return;
+    }
+    let span = (d.now - app.range.secs(), d.now);
+    let chart_h = ((ui.available_height() - 200.0) / 2.0).clamp(90.0, 200.0);
+    egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+        let t = |v: Option<f32>| v.map_or("n/a".to_string(), |c| format!("{c:.0} C"));
+        egui::Grid::new("heat").num_columns(2).spacing([24.0, 6.0]).striped(true).show(ui, |ui| {
+            let peak_at = h.peak_ts.map(|ts| format!(" at {}", axis_label(ts))).unwrap_or_default();
+            let rows = [
+                ("Peak", format!("{}{peak_at}", t(h.peak_c))),
+                ("Average", t(h.avg_c)),
+                ("When the CPU was idle", h.idle_c.map_or("not enough idle time to tell".to_string(), |c| format!("{c:.0} C typical"))),
+                ("At 80 C or more", HeatSummary::mins(h.secs_over_warm)),
+                ("At 90 C or more", HeatSummary::mins(h.secs_over_hot)),
+                ("At 95 C or more", HeatSummary::mins(h.secs_over_critical)),
+                ("Slowed down while hot", HeatSummary::mins(h.secs_slowed_by_heat)),
+                ("GPU peak", t(h.gpu_peak_c)),
+                ("GPU slowed by heat", HeatSummary::mins(h.gpu_heat_throttle_secs)),
+            ];
+            for (k, v) in rows {
+                ui.label(k);
+                ui.label(v);
+                ui.end_row();
+            }
+        });
+        ui.add_space(8.0);
+        let tmax = d.points.iter().flat_map(|p| [p.temp, p.gpu_temp]).flatten().fold(95.0, f64::max) + 5.0;
+        let guide = |name: &'static str, c: f64, color: Color32| (name, color, vec![[span.0 as f64, c], [span.1 as f64, c]]);
+        let mut temp_lines = [lines("System", RED, &d.points, |p| p.temp), lines("GPU", PURPLE, &d.points, |p| p.gpu_temp)].concat();
+        temp_lines.push(guide("80 C", 80.0, ORANGE));
+        temp_lines.push(guide("90 C", 90.0, RED));
+        chart(ui, "th_temp", "Temperature (orange line 80 C, red line 90 C)", " C", chart_h, tmax, span, temp_lines, &[]);
+        ui.add_space(6.0);
+        let speed = [lines("CPU speed", BLUE, &d.points, |p| p.freq), lines("CPU load", MUTED, &d.points, |p| Some(p.cpu))].concat();
+        chart(ui, "th_speed", "CPU speed vs load (speed dropping while load is high and it is hot means throttling)", "%", chart_h, 100.0, span, speed, &[]);
+        ui.add_space(6.0);
+        ui.label(RichText::new("Temperature comes from the hottest system sensor Windows or Linux exposes, which on some laptops is a case reading rather than the CPU itself.").color(MUTED).small());
+    });
+}
+
 fn sensors(app: &App, ui: &mut egui::Ui) {
     let Some(s) = app.data.as_ref().and_then(|d| d.latest.as_ref()) else {
         ui.add_space(16.0);
@@ -628,7 +706,7 @@ impl eframe::App for App {
             });
             ui.add_space(4.0);
             ui.horizontal(|ui| {
-                for (t, label) in [(Tab::Timeline, "Timeline"), (Tab::Why, "Why was it slow?"), (Tab::Sensors, "Sensors"), (Tab::About, "About")] {
+                for (t, label) in [(Tab::Timeline, "Timeline"), (Tab::Why, "Why was it slow?"), (Tab::Thermal, "Thermal"), (Tab::Sensors, "Sensors"), (Tab::About, "About")] {
                     ui.selectable_value(&mut self.tab, t, label);
                 }
             });
@@ -638,6 +716,7 @@ impl eframe::App for App {
         egui::CentralPanel::default().show(ui, |ui| match self.tab {
             Tab::Timeline => timeline(self, ui, &mut actions),
             Tab::Why => why(self, ui, &mut actions),
+            Tab::Thermal => thermal(self, ui, &mut actions),
             Tab::Sensors => sensors(self, ui),
             Tab::About => about(self, ui),
         });
@@ -666,6 +745,7 @@ fn parse_args(args: impl Iterator<Item = String>) -> (Option<PathBuf>, Startup) 
                 start.tab = match args.next().as_deref() {
                     Some("timeline") => Some(Tab::Timeline),
                     Some("why") => Some(Tab::Why),
+                    Some("thermal") => Some(Tab::Thermal),
                     Some("sensors") => Some(Tab::Sensors),
                     Some("about") => Some(Tab::About),
                     _ => None,

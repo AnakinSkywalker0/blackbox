@@ -73,10 +73,16 @@ pub struct Point {
     pub gpu: Option<f64>,
     pub temp: Option<f64>,
     pub gpu_temp: Option<f64>,
+    /// Lowest CPU speed in the bucket (percent of rated), so a throttling dip stays visible.
+    pub freq: Option<f64>,
 }
 
 fn mem_pct(s: &Sample) -> f64 {
     if s.mem_total == 0 { 0.0 } else { s.mem_used as f64 * 100.0 / s.mem_total as f64 }
+}
+
+fn min_opt(vals: impl Iterator<Item = Option<f32>>) -> Option<f64> {
+    vals.flatten().map(f64::from).fold(None, |m: Option<f64>, v| Some(m.map_or(v, |m| m.min(v))))
 }
 
 fn max_opt(vals: impl Iterator<Item = Option<f32>>) -> Option<f64> {
@@ -101,6 +107,7 @@ pub fn downsample(samples: &[Sample], max_points: usize) -> Vec<Point> {
                 gpu: max_opt(c.iter().map(|s| s.sensors.gpu_pct)),
                 temp: max_opt(c.iter().map(|s| s.sensors.temp_c)),
                 gpu_temp: max_opt(c.iter().map(|s| s.sensors.gpu_temp_c)),
+                freq: min_opt(c.iter().map(|s| s.sensors.freq_pct)),
             }
         })
         .collect()
@@ -126,6 +133,95 @@ pub fn split_at_gaps(points: &[Point]) -> Vec<&[Point]> {
     }
     runs.push(&points[start..]);
     runs
+}
+
+// ---- heat exposure ---------------------------------------------------------------------
+
+pub const WARM_C: f32 = 80.0;
+pub const HOT_C: f32 = 90.0;
+pub const CRITICAL_C: f32 = 95.0;
+
+/// How hot the machine ran over a stretch of time, from the raw recorded samples.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct HeatSummary {
+    /// Seconds that had a temperature reading at all.
+    pub measured_secs: i64,
+    pub peak_c: Option<f32>,
+    pub peak_ts: Option<i64>,
+    pub avg_c: Option<f32>,
+    /// Typical temperature while the CPU was nearly idle (below 10%). High values here point
+    /// at poor cooling rather than heavy work.
+    pub idle_c: Option<f32>,
+    pub secs_over_warm: i64,
+    pub secs_over_hot: i64,
+    pub secs_over_critical: i64,
+    /// Seconds spent both hot (80 C or more) and running well below full speed.
+    pub secs_slowed_by_heat: i64,
+    pub gpu_peak_c: Option<f32>,
+    pub gpu_heat_throttle_secs: i64,
+}
+
+impl HeatSummary {
+    pub fn mins(secs: i64) -> String {
+        if secs < 60 { format!("{secs} s") } else if secs < 3600 { format!("{:.0} min", secs as f64 / 60.0) } else { format!("{:.1} h", secs as f64 / 3600.0) }
+    }
+
+    /// One plain sentence on how the machine's temperature looked, with a colour hint.
+    pub fn verdict(&self) -> (&'static str, String) {
+        let Some(peak) = self.peak_c else {
+            return ("muted", "No temperature readings in this range. This machine may not expose a temperature sensor.".into());
+        };
+        if self.secs_over_critical > 0 || self.secs_slowed_by_heat >= 120 {
+            let extra = if self.secs_slowed_by_heat >= 120 { format!(" and it ran below full speed for {} while hot", Self::mins(self.secs_slowed_by_heat)) } else { String::new() };
+            return ("bad", format!("Running too hot: peaked at {peak:.0} C{extra}. Check vents and fans for dust, and avoid soft surfaces."));
+        }
+        if self.secs_over_hot > 0 {
+            return ("warn", format!("Hot at times: {} at 90 C or more (peak {peak:.0} C). Fine briefly under heavy load, worth watching.", Self::mins(self.secs_over_hot)));
+        }
+        if let Some(idle) = self.idle_c.filter(|i| *i >= 65.0) {
+            return ("warn", format!("Warm even when idle ({idle:.0} C typical). That usually means dust, dried thermal paste or a weak fan."));
+        }
+        ("good", format!("Temperatures look healthy (peak {peak:.0} C)."))
+    }
+}
+
+/// Summarises heat over `samples` (oldest first). Each sample counts for the time until the
+/// next one, capped at a minute so a recording gap isn't counted as time spent hot.
+pub fn heat_summary(samples: &[Sample]) -> HeatSummary {
+    let mut h = HeatSummary::default();
+    let (mut sum, mut n) = (0.0f64, 0u64);
+    let mut idle: Vec<f32> = Vec::new();
+    for (i, s) in samples.iter().enumerate() {
+        let dt = samples.get(i + 1).map_or(1, |nx| (nx.ts - s.ts).clamp(0, 60));
+        if let Some(t) = s.sensors.temp_c {
+            h.measured_secs += dt;
+            sum += f64::from(t);
+            n += 1;
+            if h.peak_c.is_none_or(|p| t > p) {
+                h.peak_c = Some(t);
+                h.peak_ts = Some(s.ts);
+            }
+            if t >= WARM_C { h.secs_over_warm += dt; }
+            if t >= HOT_C { h.secs_over_hot += dt; }
+            if t >= CRITICAL_C { h.secs_over_critical += dt; }
+            if t >= WARM_C && s.sensors.freq_pct.is_some_and(|f| f < 70.0) && s.cpu_pct >= 30.0 {
+                h.secs_slowed_by_heat += dt;
+            }
+            if s.cpu_pct < 10.0 { idle.push(t); }
+        }
+        if let Some(g) = s.sensors.gpu_temp_c {
+            if h.gpu_peak_c.is_none_or(|p| g > p) { h.gpu_peak_c = Some(g); }
+        }
+        if s.sensors.gpu_throttle.is_some_and(|b| b & bb_core::model::GPU_THERMAL != 0) {
+            h.gpu_heat_throttle_secs += dt;
+        }
+    }
+    if n > 0 { h.avg_c = Some((sum / n as f64) as f32); }
+    if idle.len() >= 30 {
+        idle.sort_by(f32::total_cmp);
+        h.idle_c = Some(idle[idle.len() / 2]);
+    }
+    h
 }
 
 // ---- explained moments -----------------------------------------------------------------
@@ -374,6 +470,42 @@ mod tests {
     fn recorder_pid_is_none_without_a_pid_file() {
         let db = std::env::temp_dir().join(format!("bb-gui-nopid-{}.db", std::process::id()));
         assert_eq!(recorder_pid(&db), None);
+    }
+
+    fn hot_sample(ts: i64, temp: f32, cpu: f32, freq: f32) -> Sample {
+        Sample { ts, cpu_pct: cpu, sensors: Sensors { temp_c: Some(temp), freq_pct: Some(freq), ..Default::default() }, ..Default::default() }
+    }
+
+    #[test]
+    fn heat_summary_counts_time_over_each_limit() {
+        let mut v: Vec<Sample> = (0..100).map(|i| hot_sample(i, 60.0, 5.0, 100.0)).collect();
+        v.extend((100..160).map(|i| hot_sample(i, 92.0, 90.0, 55.0)));
+        v.extend((160..170).map(|i| hot_sample(i, 96.0, 90.0, 100.0)));
+        let h = heat_summary(&v);
+        assert_eq!(h.peak_c, Some(96.0));
+        assert_eq!(h.peak_ts, Some(160));
+        assert_eq!(h.secs_over_warm, 70);
+        assert_eq!(h.secs_over_hot, 70);
+        assert_eq!(h.secs_over_critical, 10);
+        assert_eq!(h.secs_slowed_by_heat, 60, "hot and well below full speed");
+        assert_eq!(h.idle_c, Some(60.0));
+        assert_eq!(h.verdict().0, "bad");
+    }
+
+    #[test]
+    fn a_recording_gap_is_not_counted_as_heat() {
+        let v = vec![hot_sample(0, 96.0, 90.0, 100.0), hot_sample(10_000, 50.0, 5.0, 100.0)];
+        assert_eq!(heat_summary(&v).secs_over_critical, 60);
+    }
+
+    #[test]
+    fn no_sensor_gives_an_honest_message_and_healthy_data_is_good() {
+        let none = heat_summary(&[sample(0, 5.0), sample(1, 5.0)]);
+        assert_eq!((none.peak_c, none.verdict().0), (None, "muted"));
+        let v: Vec<Sample> = (0..100).map(|i| hot_sample(i, 45.0, 5.0, 100.0)).collect();
+        assert_eq!(heat_summary(&v).verdict().0, "good");
+        let warm_idle: Vec<Sample> = (0..100).map(|i| hot_sample(i, 70.0, 3.0, 100.0)).collect();
+        assert_eq!(heat_summary(&warm_idle).verdict().0, "warn");
     }
 
     #[test]

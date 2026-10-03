@@ -20,6 +20,9 @@
 #ifndef SourceExe
   #define SourceExe "..\target\release\bb.exe"
 #endif
+#ifndef SourceGui
+  #define SourceGui "..\target\release\bb-gui.exe"
+#endif
 
 [Setup]
 ; Never change this GUID: it is how Windows and winget recognise upgrades.
@@ -48,24 +51,38 @@ UninstallDisplayIcon={app}\bb.exe
 ; A running recorder is stopped explicitly in PrepareToInstall.
 CloseApplications=no
 
+[Tasks]
+; Shortcuts for the desktop window (bb-gui.exe). Both are on by default; silent installs get them too.
+Name: "desktopicon"; Description: "Create a &desktop shortcut"; GroupDescription: "Shortcuts:"
+Name: "startmenuicon"; Description: "Add to the &Start menu"; GroupDescription: "Shortcuts:"
+
 [Files]
 Source: "{#SourceExe}"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#SourceGui}"; DestDir: "{app}"; Flags: ignoreversion
+
+[Icons]
+Name: "{autodesktop}\blackbox"; Filename: "{app}\bb-gui.exe"; Comment: "Why was my computer slow?"; Tasks: desktopicon
+Name: "{autoprograms}\blackbox"; Filename: "{app}\bb-gui.exe"; Comment: "Why was my computer slow?"; Tasks: startmenuicon
 
 [Run]
 ; Adds the folder to PATH and registers start at login. Does NOT start the recorder.
 Filename: "{app}\bb.exe"; Parameters: "install --no-start"; StatusMsg: "Setting up blackbox..."; Flags: runhidden
 ; Upgrade only: put the recorder back if it was running before this install stopped it.
 Filename: "{app}\bb.exe"; Parameters: "start --quiet"; Check: RecorderWasRunning; StatusMsg: "Restarting the recorder..."; Flags: runhidden
-; Interactive installs only (skipped when silent): offer to start recording right away.
+; Interactive installs only (skipped when silent): offer to open the window and start recording.
+Filename: "{app}\bb-gui.exe"; Description: "Open the blackbox window"; Flags: nowait postinstall skipifsilent unchecked
 Filename: "{app}\bb.exe"; Parameters: "start"; Description: "Start recording now"; Flags: nowait postinstall skipifsilent runhidden
 
 [UninstallRun]
+; Close the window first so its file can be deleted.
+Filename: "{sys}\taskkill.exe"; Parameters: "/F /IM bb-gui.exe"; RunOnceId: "BlackboxCloseGui"; Flags: runhidden
 ; Stops the recorder and removes start at login and the PATH entry, before files are deleted.
 Filename: "{app}\bb.exe"; Parameters: "uninstall"; RunOnceId: "BlackboxUninstall"; Flags: runhidden
 
 [UninstallDelete]
 ; Left behind by `bb update`.
 Type: files; Name: "{app}\bb.exe.old"
+Type: files; Name: "{app}\bb-gui.exe.old"
 
 [Code]
 var

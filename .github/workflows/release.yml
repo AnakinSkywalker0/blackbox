@@ -71,12 +71,18 @@ jobs:
       - name: Build
         run: cargo build --release --locked -p bb-cli ${{ matrix.target && format('--target {0}', matrix.target) || '' }}
 
+      - name: Build the desktop window (Windows)
+        if: runner.os == 'Windows'
+        run: cargo build --release --locked -p bb-gui
+
       - name: Check bb.exe has no Visual C++ runtime dependency
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          if (Select-String -Path ${{ matrix.bindir }}/bb.exe -Pattern 'VCRUNTIME140' -Quiet) {
-            throw "bb.exe imports VCRUNTIME140.dll. A clean Windows install lacks it and the installer would hang. Keep crt-static on (.cargo/config.toml)."
+          foreach ($f in 'bb.exe', 'bb-gui.exe') {
+            if (Select-String -Path "${{ matrix.bindir }}/$f" -Pattern 'VCRUNTIME140' -Quiet) {
+              throw "$f imports VCRUNTIME140.dll. A clean Windows install lacks it. Keep crt-static on (.cargo/config.toml)."
+            }
           }
 
       - name: Package
@@ -86,6 +92,7 @@ jobs:
           dir="bb-v${version}-${{ matrix.name }}"
           mkdir "$dir"
           cp "${{ matrix.bindir }}/${{ matrix.exe }}" README.md LICENSE "$dir/"
+          if [ "${{ runner.os }}" = "Windows" ]; then cp "${{ matrix.bindir }}/bb-gui.exe" "$dir/"; fi
           if [ "${{ runner.os }}" = "Windows" ]; then
             asset="$dir.zip"
             7z a -tzip "$asset" "$dir" > /dev/null
@@ -143,6 +150,9 @@ jobs:
           $said = (& $bb --version).Trim()
           if ($said -ne "bb $env:INSTALLER_VERSION") { throw "installed program says '$said'" }
           if (Get-Process bb -ErrorAction SilentlyContinue) { throw "a fresh silent install must not start the recorder" }
+          if (-not (Test-Path "$dir\bb-gui.exe")) { throw "the desktop window (bb-gui.exe) wasn't installed" }
+          $desktop = [Environment]::GetFolderPath('DesktopDirectory')
+          if (-not (Test-Path "$desktop\blackbox.lnk")) { throw "the desktop shortcut wasn't created" }
           if (-not (Get-ItemProperty $runKey -ErrorAction SilentlyContinue).blackbox) {
             Write-Host "start at login is missing. Running bb install --no-start by hand to show why:"
             & $bb install --no-start
@@ -171,6 +181,7 @@ jobs:
           Start-Sleep 5
           if (Get-Process bb -ErrorAction SilentlyContinue) { throw "the recorder is still running after uninstall" }
           if ((Get-ItemProperty $runKey -ErrorAction SilentlyContinue).blackbox) { throw "start at login wasn't removed" }
+          if (Test-Path "$desktop\blackbox.lnk") { throw "the desktop shortcut wasn't removed" }
       - uses: actions/upload-artifact@v4
         if: runner.os == 'Windows'
         with:

@@ -86,18 +86,56 @@ fn sha256_hex(bytes: &[u8]) -> String {
 
 /// Finds `bb.exe` inside a release zip and returns its bytes.
 fn extract_exe(zip_bytes: &[u8]) -> Result<Vec<u8>, String> {
+    extract_named(zip_bytes, "bb.exe")?.ok_or_else(|| "bb.exe wasn't found inside the download".into())
+}
+
+/// Finds the file called `name` inside a release zip. `Ok(None)` means the zip is fine but
+/// doesn't contain it (releases before the desktop window shipped only `bb.exe`).
+fn extract_named(zip_bytes: &[u8], name: &str) -> Result<Option<Vec<u8>>, String> {
     let mut zip = zip::ZipArchive::new(Cursor::new(zip_bytes)).map_err(|e| format!("the download isn't a valid zip: {e}"))?;
     for i in 0..zip.len() {
         let file = zip.by_index(i).map_err(|e| e.to_string())?;
-        let is_exe = file.enclosed_name().and_then(|p| p.file_name().map(|n| n == "bb.exe")).unwrap_or(false);
-        if is_exe {
+        let is_it = file.enclosed_name().and_then(|p| p.file_name().map(|n| n == name)).unwrap_or(false);
+        if is_it {
             let mut out = Vec::new();
             file.take(MAX_BYTES).read_to_end(&mut out).map_err(|e| e.to_string())?;
-            return Ok(out);
+            return Ok(Some(out));
         }
     }
-    Err("bb.exe wasn't found inside the download".into())
+    Ok(None)
 }
+
+/// Replaces the desktop window next to `bb.exe`, if one is installed and the release ships a
+/// newer one. A failure here never fails the update: the recorder is what matters.
+#[cfg(windows)]
+fn update_gui(dir: &Path, zip_bytes: &[u8]) {
+    let gui = dir.join("bb-gui.exe");
+    if !gui.is_file() {
+        return;
+    }
+    let new = match extract_named(zip_bytes, "bb-gui.exe") {
+        Ok(Some(b)) => b,
+        Ok(None) => return,
+        Err(e) => return println!("Couldn't unpack the desktop window: {e}"),
+    };
+    let old = dir.join("bb-gui.exe.old");
+    // An open window can be renamed but not overwritten, so move it aside first.
+    let _ = std::fs::remove_file(&old);
+    if let Err(e) = std::fs::rename(&gui, &old) {
+        return println!("Couldn't update the desktop window ({e}). Close it and run `bb update` again.");
+    }
+    match std::fs::write(&gui, &new) {
+        Ok(()) => println!("Desktop window updated. Reopen it to use the new version."),
+        Err(e) => {
+            let _ = std::fs::remove_file(&gui);
+            let _ = std::fs::rename(&old, &gui);
+            println!("Couldn't write the new desktop window, so the old one was put back: {e}");
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn update_gui(_dir: &Path, _zip_bytes: &[u8]) {}
 
 /// Finds the `bb` program inside a release tarball and returns its bytes.
 fn extract_tar_bb(tar_gz: &[u8]) -> Result<Vec<u8>, String> {
@@ -195,7 +233,13 @@ pub fn run(db: &Path, check_only: bool) -> Res {
     }
     println!("Checksum OK ({} KB).", zip_bytes.len() / 1024);
     let exe_bytes = extract_program(&zip_bytes)?;
-    install_new(db, &exe_bytes, &latest)
+    // Read before the swap renames the running program.
+    let dir = std::env::current_exe().ok().and_then(|e| e.parent().map(Path::to_path_buf));
+    install_new(db, &exe_bytes, &latest)?;
+    if let Some(dir) = dir {
+        update_gui(&dir, &zip_bytes);
+    }
+    Ok(())
 }
 
 /// Writes the new binary somewhere safe, proves it runs and reports the right
@@ -302,6 +346,7 @@ pub fn clean_up_old_version() {
     #[cfg(windows)]
     if let Ok(exe) = std::env::current_exe() {
         let _ = std::fs::remove_file(exe.with_file_name("bb.exe.old"));
+        let _ = std::fs::remove_file(exe.with_file_name("bb-gui.exe.old"));
     }
 }
 
@@ -374,6 +419,16 @@ mod tests {
     #[test]
     fn sha256_matches_a_known_value() {
         assert_eq!(sha256_hex(b"abc"), "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+    }
+
+    #[test]
+    fn the_desktop_window_is_found_when_shipped_and_absent_in_old_releases() {
+        let new = make_zip(&[("bb-v0.5.0-windows-x86_64/bb.exe", b"cli"), ("bb-v0.5.0-windows-x86_64/bb-gui.exe", b"gui")]);
+        assert_eq!(extract_named(&new, "bb-gui.exe").unwrap(), Some(b"gui".to_vec()));
+        assert_eq!(extract_exe(&new).unwrap(), b"cli", "the recorder is still picked correctly");
+        let old = make_zip(&[("bb-v0.4.2-windows-x86_64/bb.exe", b"cli")]);
+        assert_eq!(extract_named(&old, "bb-gui.exe").unwrap(), None);
+        assert!(extract_named(b"not a zip", "bb-gui.exe").is_err());
     }
 
     fn make_zip(entries: &[(&str, &[u8])]) -> Vec<u8> {

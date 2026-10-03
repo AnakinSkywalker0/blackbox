@@ -23,6 +23,6 @@ ureq = { version = "3.4.2", features = ["json"] }
 zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
 
 [target."cfg(windows)".dependencies]
-windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging"] }
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging", "Win32_System_Threading"] }
 winreg = "0.56.0"
 

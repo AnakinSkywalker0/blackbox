@@ -1,3 +1,5 @@
+mod blame;
+mod fix;
 mod install;
 mod selftest;
 mod update;
@@ -116,6 +118,27 @@ enum Cmd {
         #[arg(long)]
         export: bool,
     },
+    /// Apply safe, reversible fixes (lower a CPU hog's priority, leave Power saver, trim startup) and measure the effect
+    Fix {
+        /// Reverse the last batch of fixes
+        #[arg(long)]
+        undo: bool,
+        /// Apply every proposed change without asking one by one
+        #[arg(long, short)]
+        yes: bool,
+        /// Only show what would be changed
+        #[arg(long)]
+        dry_run: bool,
+        /// Limit to these kinds: priority, power, startup (startup is only offered when named)
+        #[arg(long, value_delimiter = ',')]
+        only: Vec<String>,
+    },
+    /// Which programs cost you the most heat, battery and CPU, and what got heavier lately
+    Blame {
+        /// Days of history to look at
+        #[arg(long, default_value_t = 7)]
+        days: i64,
+    },
     /// Show what has been recorded
     Status,
     /// Show which sensors (battery, temperature, GPU, disk latency) work on this machine
@@ -159,6 +182,8 @@ fn main() {
         Cmd::Top { n, watch } => top(n, watch),
         Cmd::Why { when, span } => why(&db, &when, &span),
         Cmd::Feedback { verdict, note, summary, export } => feedback(&db, verdict, note.as_deref().unwrap_or(""), summary, export),
+        Cmd::Fix { undo, yes, dry_run, only } => fix::run(&db, undo, yes, dry_run, &only),
+        Cmd::Blame { days } => blame::run(&db, days),
         Cmd::Status => status(&db),
         Cmd::Sensors => sensors(),
         Cmd::Selftest { only, memory } => selftest::run(&only, memory, install::running_pid(&db).is_some()),

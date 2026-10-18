@@ -31,7 +31,7 @@ Status: **v0.4.2 released**. `bb fix`, `bb blame` and the desktop window (`bb-gu
 |---|---|---|
 | **Release it** | The installer and release workflow already include it, but no tagged release does yet. | v0.5 ships `bb-gui.exe` with its shortcuts, and `bb update` replaces it. |
 | **Tray icon and notifications** | The value is in noticing a slowdown *as it happens*. | A tray icon with recorder status, and an optional notification when a high-confidence finding appears. |
-| **Headless screenshot tests** | GUI changes are checked by eye. | `egui_kittest` snapshot tests render each tab from a fixture database in CI, with no window opened. |
+| **Screenshot tests in CI** | Every screen can already be rendered offscreen from a fixture database (`UPDATE_SNAPSHOTS=1 cargo test -p bb-gui screenshots -- --ignored`), but only by hand, since it needs a GPU adapter. | CI renders them with a software adapter and fails when a screen changes unexpectedly. |
 | **Linux and macOS builds** | The window is Windows-tested only. | CI builds and smoke-tests it on all three. |
 
 ## 4. Share and report

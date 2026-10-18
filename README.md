@@ -274,7 +274,7 @@ These are on `main` and pass CI, but no release includes them yet. Build from so
 |---|---|
 | `bb blame [--days 7]` | Which programs cost you the most heat, battery and CPU over your history, and what got heavier lately. Needs a day or two of recording |
 | `bb fix` | Proposes safe, reversible fixes (lower a CPU hog's priority, leave Power saver, trim start-at-login entries with `--only startup`), asks before each one, and measures the effect. `--dry-run` only shows them, and `--undo` reverses the last batch |
-| `bb-gui` | A desktop window: recorder status, timeline charts with explained moments shaded, a "Why was it slow?" panel with feedback buttons, a Thermal tab (time spent over 80, 90 and 95 C), and Sensors. The installer adds Start-menu and desktop shortcuts |
+| `bb-gui` | A desktop window laid out like a status page. Home says how the computer is doing right now, shows a 24-hour strip with slowdowns marked, and lists each slowdown as a card. Click one for the plain-English explanation, evidence, what you can do, and Yes/Partly/No feedback. The sidebar has a chart each for CPU, memory, disk, GPU and heat (with time spent over 80 and 90 C), plus Sensors. It follows the system light or dark mode. The installer adds Start-menu and desktop shortcuts |
 
 ---
 

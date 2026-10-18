@@ -12,7 +12,6 @@ use std::process::{Command, Stdio};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Range {
-    M15,
     H1,
     H6,
     H24,
@@ -20,11 +19,8 @@ pub enum Range {
 }
 
 impl Range {
-    pub const ALL: [Range; 5] = [Range::M15, Range::H1, Range::H6, Range::H24, Range::D7];
-
     pub fn secs(self) -> i64 {
         match self {
-            Range::M15 => 15 * 60,
             Range::H1 => 3600,
             Range::H6 => 6 * 3600,
             Range::H24 => 24 * 3600,
@@ -34,7 +30,6 @@ impl Range {
 
     pub fn label(self) -> &'static str {
         match self {
-            Range::M15 => "15 min",
             Range::H1 => "1 hour",
             Range::H6 => "6 hours",
             Range::H24 => "24 hours",
@@ -277,6 +272,115 @@ pub fn find_moments(store: &Store, from: i64, to: i64, best_mhz: u32, window: i6
     merge_moments(found)
 }
 
+/// A short, plain headline for a kind of cause, for the slowdown cards. The rule's own title
+/// (which names the program) is shown underneath.
+pub fn headline(kind: &str) -> &'static str {
+    match kind {
+        "cpu_hog" => "One program hogged the CPU",
+        "cpu_saturated" => "The CPU was fully busy",
+        "memory" => "Running out of memory",
+        "memory_squeeze" => "A short memory squeeze",
+        "cpu_throttle" => "The CPU slowed itself down",
+        "battery_saver" => "Battery Saver slowed things down",
+        "battery_low" => "Battery nearly empty",
+        "gpu_throttle" => "The GPU slowed itself down",
+        "gpu_busy" => "The GPU was maxed out",
+        "gpu_hot" => "The GPU ran very hot",
+        "hot" => "Running very hot",
+        "disk_heavy" => "Heavy disk activity",
+        "disk_slow" => "The disk was slow to respond",
+        "cpu_spike" => "Short CPU spike",
+        "disk_stall" => "A brief disk stall",
+        "stall" => "The machine froze",
+        _ => "Something slowed it down",
+    }
+}
+
+/// How long a stretch lasted, for people: "45 s", "4 min", "1 h 20 min".
+pub fn duration_text(secs: i64) -> String {
+    let secs = secs.max(1);
+    if secs < 60 {
+        format!("{secs} s")
+    } else if secs < 3600 {
+        format!("{} min", (secs + 30) / 60)
+    } else {
+        let m = (secs + 30) / 60;
+        if m % 60 == 0 { format!("{} h", m / 60) } else { format!("{} h {} min", m / 60, m % 60) }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Health {
+    /// Nothing recorded recently, so the window can't say anything about now.
+    Unknown,
+    Good,
+    /// A slowdown is happening or ended moments ago.
+    Slow,
+}
+
+/// The one-line status at the top of Home, and the line under it.
+pub fn home_status(now: i64, recording: bool, last_sample: Option<i64>, moments: &[Moment]) -> (Health, String, String) {
+    let fresh = last_sample.is_some_and(|t| now - t <= 30);
+    let n = moments.len();
+    let summary = match n {
+        0 => "No slowdowns in the last 24 hours".to_string(),
+        1 => "1 slowdown in the last 24 hours, explained below".to_string(),
+        _ => format!("{n} slowdowns in the last 24 hours, explained below"),
+    };
+    if !recording || !fresh {
+        let since = match last_sample {
+            None => "Nothing recorded yet. Start recording so there's something to explain later.".to_string(),
+            Some(_) if fresh => "The recorder isn't running, so new slowdowns won't be explained.".to_string(),
+            Some(t) => format!("Last recorded {} ago. Slowdowns while it's off can't be explained.", duration_text(now - t)),
+        };
+        return (Health::Unknown, "Not recording".into(), since);
+    }
+    match moments.iter().rev().find(|m| now - m.to <= 300) {
+        Some(m) => (Health::Slow, format!("Slow right now: {}", headline(m.kind).to_lowercase()), summary),
+        None => (Health::Good, "Running smoothly right now".into(), summary),
+    }
+}
+
+/// One block of the 24-hour strip on Home.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Slot {
+    NoData,
+    Fine,
+    /// Index into the moments list, of the most confident moment in this block.
+    Slow(usize, Confidence),
+}
+
+/// Splits `[now - span, now]` into `n` blocks and marks each as unrecorded, fine, or slow.
+pub fn strip(now: i64, span: i64, n: usize, points: &[Point], moments: &[Moment]) -> Vec<Slot> {
+    let n = n.max(1);
+    let w = span as f64 / n as f64;
+    let start = (now - span) as f64;
+    let mut out = vec![Slot::NoData; n];
+    for p in points {
+        let i = ((p.ts - start) / w).floor();
+        if i >= 0.0 && (i as usize) < n {
+            out[i as usize] = Slot::Fine;
+        }
+    }
+    for (k, m) in moments.iter().enumerate() {
+        let a = ((m.from as f64 - start) / w).floor().max(0.0) as usize;
+        let b = ((m.to as f64 - start) / w).floor();
+        if b < 0.0 {
+            continue;
+        }
+        for slot in out.iter_mut().take((b as usize).min(n - 1) + 1).skip(a) {
+            let stronger = match *slot {
+                Slot::Slow(_, c) => m.confidence > c,
+                _ => true,
+            };
+            if stronger {
+                *slot = Slot::Slow(k, m.confidence);
+            }
+        }
+    }
+    out
+}
+
 // ---- the recorder and the bb program ---------------------------------------------------
 
 /// Pid of a live `bb` recorder for this database, from the pid file `bb run` keeps.
@@ -332,10 +436,11 @@ mod tests {
 
     #[test]
     fn ranges_have_sensible_windows() {
-        assert_eq!(Range::M15.moment_window(), 240);
+        assert_eq!(Range::H1.moment_window(), 240);
         assert_eq!(Range::H24.moment_window(), 240);
         assert!(Range::D7.moment_window() > 1000);
-        assert!(Range::ALL.windows(2).all(|w| w[0].secs() < w[1].secs()));
+        let all = [Range::H1, Range::H6, Range::H24, Range::D7];
+        assert!(all.windows(2).all(|w| w[0].secs() < w[1].secs()));
     }
 
     #[test]
@@ -506,6 +611,56 @@ mod tests {
         assert_eq!(heat_summary(&v).verdict().0, "good");
         let warm_idle: Vec<Sample> = (0..100).map(|i| hot_sample(i, 70.0, 3.0, 100.0)).collect();
         assert_eq!(heat_summary(&warm_idle).verdict().0, "warn");
+    }
+
+    #[test]
+    fn every_kind_has_a_plain_headline() {
+        for k in ["cpu_hog", "cpu_saturated", "memory", "memory_squeeze", "cpu_throttle", "battery_saver", "battery_low", "gpu_throttle", "gpu_busy", "gpu_hot", "hot", "disk_heavy", "disk_slow", "cpu_spike", "disk_stall", "stall"] {
+            assert_ne!(headline(k), headline("other"), "{k}");
+        }
+    }
+
+    #[test]
+    fn durations_read_naturally() {
+        assert_eq!(duration_text(0), "1 s");
+        assert_eq!(duration_text(45), "45 s");
+        assert_eq!(duration_text(240), "4 min");
+        assert_eq!(duration_text(3600), "1 h");
+        assert_eq!(duration_text(4800), "1 h 20 min");
+    }
+
+    #[test]
+    fn home_status_says_what_is_true() {
+        let now = 100_000;
+        let old = moment(now - 5000, now - 4000, "memory", Confidence::High);
+        let (h, title, sub) = home_status(now, true, Some(now - 1), std::slice::from_ref(&old));
+        assert_eq!(h, Health::Good);
+        assert!(title.contains("smoothly") && sub.starts_with("1 slowdown"), "{title} / {sub}");
+        let recent = moment(now - 200, now - 60, "memory", Confidence::High);
+        let (h, title, _) = home_status(now, true, Some(now - 1), &[old.clone(), recent]);
+        assert_eq!(h, Health::Slow);
+        assert!(title.contains("running out of memory"), "{title}");
+        // Not recording, or a stale last sample, never claims the machine is fine.
+        assert_eq!(home_status(now, false, Some(now - 1), &[]).0, Health::Unknown);
+        assert_eq!(home_status(now, true, Some(now - 3600), &[]).0, Health::Unknown);
+        assert!(home_status(now, true, None, &[]).2.contains("Nothing recorded"));
+    }
+
+    #[test]
+    fn strip_marks_gaps_fine_time_and_slowdowns() {
+        let now = 24 * 3600;
+        // Recording only in the second half of the day.
+        let pts: Vec<Point> = (12 * 60..24 * 60).map(|m| pt((m * 60) as f64)).collect();
+        let ms = vec![moment(20 * 3600, 20 * 3600 + 600, "memory", Confidence::Medium), moment(20 * 3600 + 100, 20 * 3600 + 200, "cpu_hog", Confidence::High)];
+        let s = strip(now, 24 * 3600, 24, &pts, &ms);
+        assert_eq!(s.len(), 24);
+        assert_eq!(s[3], Slot::NoData);
+        assert_eq!(s[13], Slot::Fine);
+        assert_eq!(s[20], Slot::Slow(1, Confidence::High), "the more confident moment wins");
+        // A moment that started before the strip still shows, and nothing panics at the edges.
+        let early = vec![moment(-500, 30, "memory", Confidence::Low)];
+        assert_eq!(strip(now, 24 * 3600, 24, &[], &early)[0], Slot::Slow(0, Confidence::Low));
+        assert_eq!(strip(now, 24 * 3600, 0, &[], &[]).len(), 1);
     }
 
     #[test]

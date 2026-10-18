@@ -15,3 +15,6 @@ chrono = "0.4.45"
 eframe = "0.36.2"
 egui_plot = "0.37.0"
 sysinfo = "0.39.6"
+
+[dev-dependencies]
+egui_kittest = { version = "0.36", features = ["wgpu", "snapshot", "eframe"] }

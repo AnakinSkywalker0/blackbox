@@ -1,16 +1,28 @@
 # blackbox (`bb`)
 
-A flight recorder for your computer's performance.
+**A flight recorder for your computer's performance. Ask it why your machine was slow, and it tells you.**
 
-Windows shows you numbers (Task Manager) or raw traces (Performance Recorder), but never tells you **why** it was slow. blackbox records your machine's vitals in the background. When something felt slow, you ask it:
+[![CI](https://github.com/AnakinSkywalker0/blackbox/actions/workflows/ci.yml/badge.svg)](https://github.com/AnakinSkywalker0/blackbox/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/AnakinSkywalker0/blackbox)](https://github.com/AnakinSkywalker0/blackbox/releases/latest)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
+![Platforms](https://img.shields.io/badge/platforms-Windows%20%7C%20Linux%20%7C%20macOS-informational)
+![Rust](https://img.shields.io/badge/built%20with-Rust-orange)
 
-```
-bb why 15:40
-```
+<p align="center"><img src="docs/img/bb-why.svg" alt="bb why naming memory pressure as the cause of a slowdown, with evidence" width="640"></p>
 
-and it answers in plain English with evidence.
+Task Manager shows you numbers and Performance Recorder gives you raw traces, but neither tells you **why** the machine was slow. blackbox records your machine's vitals once a second in the background, using about 2% of one core. When something felt slow, run `bb why 15:40` and it names the likely cause in plain English, with the evidence.
 
-> **Status: v0.4.** Runs on Windows, Linux and macOS, and checks itself: `bb selftest` causes real slowdowns on your machine and verifies that `bb why` names them. Records CPU, memory, pagefile, disk throughput and latency, clock speed, temperature, battery/power state, GPU load and the busiest programs, and explains a dozen kinds of slowdown, including short spikes and freezes. See [Limits](#limits-read-this) before trusting it blindly.
+The capture above is real and unstaged. It was taken during a release build of blackbox itself. The obvious suspect was the compiler. The recording shows the build was mostly a single-threaded link, and the real problem was RAM at 84 to 95% full with Windows paging memory out to disk. That's the kind of answer blackbox is built to give.
+
+### Highlights
+
+- **It tests itself.** `bb selftest` causes real slowdowns on your machine (CPU hog, a short burst, heavy disk, memory pressure) plus a quiet control run, then reports "detected N of M" and any false alarms.
+- **It explains 14 kinds of slowdown**, including short CPU spikes and disk stalls that averages hide, CPU throttling with the cause (heat, Battery Saver, battery limits), GPU throttling, and machine stalls.
+- **Private by design.** Everything stays in a local SQLite file. The only network use is `bb update`, which runs only when you type it.
+- **Small and cheap.** About 2% of one core and 40 MB of RAM on Windows. Old data is thinned automatically, so a week of history is about 140 MB.
+- **Easy to install and update.** One-line installers, a Windows installer, Scoop, and `bb update` with checksum verification. About 135 automated tests run on Windows, Linux and macOS in CI.
+
+> **Status: v0.4.2.** Runs on Windows, Linux and macOS. Windows has the most sensors. See [Limits](#limits-read-this) before trusting it blindly, and the [roadmap](ROADMAP.md) for what's next.
 
 ---
 
@@ -85,9 +97,7 @@ cd blackbox
 cargo build --release
 ```
 
-The program is `target\release\bb.exe` (Windows) or `target/release/bb` (Linux/macOS). Copy it somewhere on your `PATH`, for example `C:\Tools\bb.exe`, so you can just type `bb`.
-
-> **Heads up:** v0.1 was developed and tested on Linux. It uses the cross-platform `sysinfo` crate, so it should behave the same on Windows, but the Windows build has not been verified yet. If the build or the first run misbehaves, see [Troubleshooting](#troubleshooting).
+The program is `target\release\bb.exe` (Windows) or `target/release/bb` (Linux/macOS). Copy it somewhere on your `PATH`, for example `C:\Tools\bb.exe`, so you can just type `bb`. If the build or the first run misbehaves, see [Troubleshooting](#troubleshooting).
 
 ---
 
@@ -177,19 +187,7 @@ Shows the database path and size, how many samples exist, the time range covered
 
 Shows which extra sensors work on this machine (battery and power, temperature, CPU speed, GPU load and temperature, GPU throttling, disk latency and queue) with their current readings. A sensor your hardware or drivers don't expose shows "not available", and `bb why` skips the rules that need it.
 
-```
-$ bb sensors
-  Battery / power  100%, plugged in
-  Temperature      63 C (hottest system sensor)
-  CPU speed        74% of rated maximum
-  GPU load         1%
-  GPU temperature  45 C
-  GPU throttling   none
-  Disk latency     0.2 ms per request
-  Disk queue       0.01 requests waiting
-  Disk busy        3% of the time
-  Memory paging    0 pages/s written out (0.0 MB/s)
-```
+<img src="docs/img/bb-sensors.svg" alt="bb sensors output on a Windows laptop with an NVIDIA GPU" width="520">
 
 ### `bb update`
 
@@ -267,6 +265,16 @@ Measures blackbox's own cost on **your** machine: time per sample, share of a co
 | Option | Default | Meaning |
 |---|---|---|
 | `--secs <n>` | `15` | How long to measure |
+
+### Coming in the next release
+
+These are on `main` and pass CI, but no release includes them yet. Build from source to try them.
+
+| Command | What it does |
+|---|---|
+| `bb blame [--days 7]` | Which programs cost you the most heat, battery and CPU over your history, and what got heavier lately. Needs a day or two of recording |
+| `bb fix` | Proposes safe, reversible fixes (lower a CPU hog's priority, leave Power saver, trim start-at-login entries with `--only startup`), asks before each one, and measures the effect. `--dry-run` only shows them, and `--undo` reverses the last batch |
+| `bb-gui` | A desktop window: recorder status, timeline charts with explained moments shaded, a "Why was it slow?" panel with feedback buttons, a Thermal tab (time spent over 80, 90 and 95 C), and Sensors. The installer adds Start-menu and desktop shortcuts |
 
 ---
 
@@ -413,7 +421,7 @@ blackbox is honest about what it can't see. Don't over-trust it.
 - **Thresholds are educated guesses**, not tuned on lots of real machines. Expect some wrong or missing explanations at first. Run `bb selftest` to see how it does on yours, and use `bb feedback` to record when it's wrong.
 - **Updates are checked against GitHub, not signed.** `bb update` verifies the download against the checksum published with the release, which catches corruption and tampering in transit. It does not prove who built the release: that rests on trusting the GitHub account. The Windows executable is not code-signed yet, so SmartScreen may warn on first run.
 - **Without administrator rights**, Windows may hide details for some protected system processes. They can show lower numbers than reality.
-- **Verified so far:** about 90 automated tests, and `bb selftest`, which causes real slowdowns. On a Windows 11 laptop it detected 4 of 4 induced slowdowns (CPU hog, CPU burst, heavy disk, memory pressure), with no false alarms, across repeated runs. Repeating it also exposed a flaw: a memory test that only filled RAM was sometimes missed, because Windows copes by compressing memory and nothing was actually slow. The test now forces real paging, and the rules gained a short-squeeze check that needs measured paging. On clean GitHub runners for Windows, Linux and macOS, it detected 3 of 3 (CPU hog, burst, disk). Its first run found a real flaw, a chronic false "memory pressure" on a machine that was merely at 81% with swap allocated, which is now fixed by requiring measured paging. **Not verified end to end:** heat, GPU throttle and battery causes (the sensors are read correctly, but no real slowdown of those kinds has been induced), a genuinely slow disk (a fast NVMe never got slow enough), and machine stalls.
+- **Verified so far:** about 135 automated tests, and `bb selftest`, which causes real slowdowns. On a Windows 11 laptop it detected 4 of 4 induced slowdowns (CPU hog, CPU burst, heavy disk, memory pressure), with no false alarms, across repeated runs. Repeating it also exposed a flaw: a memory test that only filled RAM was sometimes missed, because Windows copes by compressing memory and nothing was actually slow. The test now forces real paging, and the rules gained a short-squeeze check that needs measured paging. On clean GitHub runners for Windows, Linux and macOS, it detected 3 of 3 (CPU hog, burst, disk). Its first run found a real flaw, a chronic false "memory pressure" on a machine that was merely at 81% with swap allocated, which is now fixed by requiring measured paging. **Not verified end to end:** heat, GPU throttle and battery causes (the sensors are read correctly, but no real slowdown of those kinds has been induced), a genuinely slow disk (a fast NVMe never got slow enough), and machine stalls.
 
 ---
 
@@ -450,12 +458,18 @@ blackbox/
     src/store.rs        compact SQLite storage, pruning, thinning
     src/rules.rs        the "why" engine: data in, ranked causes out
     src/timeparse.rs    parses "15:40", "10m ago", ...
+    src/blame.rs        long-term cost per program (heat, battery, CPU)
     src/model.rs        shared data types
   bb-cli/               the `bb` command-line program
     src/main.rs         commands
     src/install.rs      start/stop, install/uninstall
     src/update.rs       bb update (the only code that uses the network)
     src/selftest.rs     bb selftest: causes real slowdowns and checks the explanations
+    src/fix.rs          bb fix: reversible fixes with before/after measurement
+    src/blame.rs        bb blame output
+  bb-gui/               the desktop window (egui)
+    src/main.rs         tabs, charts and the background loader
+    src/logic.rs        chart data and gap handling, unit-tested without a window
   install.ps1           one-line Windows installer script
   install.sh            one-line Linux/macOS installer script
   installer/            Inno Setup script for the Windows installer
@@ -487,8 +501,8 @@ cargo test --release -p bb-core size_of -- --ignored --nocapture
 | **v0.1** | Recorder, compact storage, `why`/`top`/`status`/`bench`, five causes, automated tests |
 | **v0.2** | Battery and power, temperature, GPU, disk latency, short-spike and stall detection, one-command `install`, background `start`/`stop`, `bb sensors` |
 | **v0.4** (now) | `bb selftest` (causes real slowdowns, reports "detected N of M" and false alarms), measured paging for memory pressure, `bb feedback`, Linux and macOS install/update, macOS and Linux CI, one-line install scripts, fixed latest-download links |
-| **Next** | Windows Event Log correlation (driver and update installs, crashes), network and per-program GPU, an HTML report, code signing, winget listing |
-| **Later** | Snapshot installed apps, startup items, drivers and services over time so `why` can say "this got slow right after the 14 Sept driver update" |
+| **v0.5** (on `main`) | `bb blame`, `bb fix`, the desktop window |
+| **Next** | See [ROADMAP.md](ROADMAP.md): retention that can't wipe history, Windows Event Log correlation, network and per-program GPU, an HTML report, tray notifications, winget and code signing |
 
 ---
 

@@ -1,13 +1,13 @@
 {
-  "version": "0.4.2",
+  "version": "0.5.0",
   "description": "A flight recorder for your computer's performance. Ask why it was slow.",
   "homepage": "https://github.com/AnakinSkywalker0/blackbox",
   "license": "MIT",
   "architecture": {
     "64bit": {
-      "url": "https://github.com/AnakinSkywalker0/blackbox/releases/download/v0.4.2/bb-v0.4.2-windows-x86_64.zip",
-      "hash": "86a0bcfabbe8b3c1e373eac01f1905c41d5c78088ab79c57b4e599f0dcbadb86",
-      "extract_dir": "bb-v0.4.2-windows-x86_64"
+      "url": "https://github.com/AnakinSkywalker0/blackbox/releases/download/v0.5.0/bb-v0.5.0-windows-x86_64.zip",
+      "hash": "3a9e69510d61f9eceda60f0e1073b00b6876fd57934fbb96116b004095ddcca1",
+      "extract_dir": "bb-v0.5.0-windows-x86_64"
     }
   },
   "bin": "bb.exe",

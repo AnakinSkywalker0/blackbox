@@ -2,7 +2,7 @@
 
 What's planned for blackbox, with the reason for each item and how to tell when it's done. Items are sized to fit in one focused piece of work. Shipped work is listed in the [README](README.md#roadmap) and in the [releases](https://github.com/AnakinSkywalker0/blackbox/releases).
 
-Status: **v0.4.2 released**. `bb fix`, `bb blame` and the desktop window (`bb-gui`) are on `main` and not yet released.
+Status: **v0.5.0 released**, with `bb fix`, `bb blame` and the desktop window.
 
 ---
 
@@ -29,7 +29,6 @@ Status: **v0.4.2 released**. `bb fix`, `bb blame` and the desktop window (`bb-gu
 
 | Item | Why | Done when |
 |---|---|---|
-| **Release it** | The installer and release workflow already include it, but no tagged release does yet. | v0.5 ships `bb-gui.exe` with its shortcuts, and `bb update` replaces it. |
 | **Tray icon and notifications** | The value is in noticing a slowdown *as it happens*. | A tray icon with recorder status, and an optional notification when a high-confidence finding appears. |
 | **Screenshot tests in CI** | Every screen can already be rendered offscreen from a fixture database (`UPDATE_SNAPSHOTS=1 cargo test -p bb-gui screenshots -- --ignored`), but only by hand, since it needs a GPU adapter. | CI renders them with a software adapter and fails when a screen changes unexpectedly. |
 | **Linux and macOS builds** | The window is Windows-tested only. | CI builds and smoke-tests it on all three. |

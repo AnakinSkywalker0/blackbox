@@ -22,7 +22,7 @@ The capture above is real and unstaged. It was taken during a release build of b
 - **Small and cheap.** About 2% of one core and 40 MB of RAM on Windows. Old data is thinned automatically, so a week of history is about 140 MB.
 - **Easy to install and update.** One-line installers, a Windows installer, Scoop, and `bb update` with checksum verification. About 135 automated tests run on Windows, Linux and macOS in CI.
 
-> **Status: v0.4.2.** Runs on Windows, Linux and macOS. Windows has the most sensors. See [Limits](#limits-read-this) before trusting it blindly, and the [roadmap](ROADMAP.md) for what's next.
+> **Status: v0.5.0**, with a desktop window. Runs on Windows, Linux and macOS. Windows has the most sensors. See [Limits](#limits-read-this) before trusting it blindly, and the [roadmap](ROADMAP.md) for what's next.
 
 ---
 
@@ -266,9 +266,9 @@ Measures blackbox's own cost on **your** machine: time per sample, share of a co
 |---|---|---|
 | `--secs <n>` | `15` | How long to measure |
 
-### Coming in the next release
+### New in 0.5
 
-These are on `main` and pass CI, but no release includes them yet. Build from source to try them.
+The Windows installer and `bb update` include the desktop window. On Linux and macOS, build `bb-gui` from source.
 
 | Command | What it does |
 |---|---|
@@ -500,8 +500,8 @@ cargo test --release -p bb-core size_of -- --ignored --nocapture
 |---|---|
 | **v0.1** | Recorder, compact storage, `why`/`top`/`status`/`bench`, five causes, automated tests |
 | **v0.2** | Battery and power, temperature, GPU, disk latency, short-spike and stall detection, one-command `install`, background `start`/`stop`, `bb sensors` |
-| **v0.4** (now) | `bb selftest` (causes real slowdowns, reports "detected N of M" and false alarms), measured paging for memory pressure, `bb feedback`, Linux and macOS install/update, macOS and Linux CI, one-line install scripts, fixed latest-download links |
-| **v0.5** (on `main`) | `bb blame`, `bb fix`, the desktop window |
+| **v0.4** | `bb selftest` (causes real slowdowns, reports "detected N of M" and false alarms), measured paging for memory pressure, `bb feedback`, Linux and macOS install/update, macOS and Linux CI, one-line install scripts, fixed latest-download links |
+| **v0.5** (now) | `bb blame`, `bb fix`, the desktop window redesigned as a status page |
 | **Next** | See [ROADMAP.md](ROADMAP.md): retention that can't wipe history, Windows Event Log correlation, network and per-program GPU, an HTML report, tray notifications, winget and code signing |
 
 ---

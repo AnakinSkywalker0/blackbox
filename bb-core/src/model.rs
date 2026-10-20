@@ -42,6 +42,9 @@ pub struct Sensors {
     /// Share of the time the disk was busy servicing requests, 0..100 (what Task Manager
     /// shows as Disk %). Unlike throughput it means the same on a slow disk and a fast one.
     pub disk_busy: Option<f32>,
+    /// Power the CPU package is drawing, in watts, from the chip's own energy counters (Intel
+    /// RAPL, Windows only). Live readings only: not stored in the database.
+    pub cpu_power_w: Option<f32>,
 }
 
 pub const GPU_THERMAL: u8 = 1;
@@ -116,6 +119,7 @@ pub fn describe_sensors(x: &Sensors) -> Vec<(&'static str, Option<String>)> {
         ("Battery / power", power),
         ("Temperature", x.temp_c.map(|c| format!("{c:.0} C (hottest system sensor)"))),
         ("CPU speed", x.freq_pct.map(|f| format!("{f:.0}% of rated maximum"))),
+        ("CPU power", x.cpu_power_w.map(|w| format!("{w:.0} W (CPU package)"))),
         ("GPU load", x.gpu_pct.map(|g| format!("{g:.0}%"))),
         ("GPU temperature", x.gpu_temp_c.map(|c| format!("{c:.0} C"))),
         ("GPU throttling", gpu_throttle),
@@ -133,12 +137,12 @@ mod tests {
     #[test]
     fn unavailable_sensors_are_none_and_present_ones_read_naturally() {
         let rows = describe_sensors(&Sensors::default());
-        assert_eq!(rows.len(), 10);
+        assert_eq!(rows.len(), 11);
         assert!(rows.iter().all(|(_, v)| v.is_none()));
 
         let x = Sensors { on_ac: Some(false), battery_pct: Some(40), battery_saver: Some(true), gpu_throttle: Some(GPU_THERMAL | GPU_POWER), ..Default::default() };
         let rows = describe_sensors(&x);
         assert_eq!(rows[0].1.as_deref(), Some("40%, on battery, Battery Saver on"));
-        assert_eq!(rows[5].1.as_deref(), Some("heat, power cap"));
+        assert_eq!(rows[6].1.as_deref(), Some("heat, power cap"));
     }
 }

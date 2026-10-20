@@ -37,6 +37,8 @@ struct Loaded {
     points: Vec<Point>,
     moments: Vec<Moment>,
     heat: HeatSummary,
+    /// The latest `bb heat test` result: when, and the score.
+    heat_score: Option<(i64, u32)>,
     latest: Option<Sample>,
     count: u64,
     first: Option<i64>,
@@ -68,7 +70,7 @@ fn spawn_worker(db: PathBuf, ctx: egui::Context) -> (Sender<Request>, Receiver<L
 
 fn load(db: &Path, req: &Request, cache: &mut Option<(Range, i64, Vec<Moment>)>) -> Loaded {
     let now = Local::now().timestamp();
-    let empty = |error: Option<String>| Loaded { range: req.range, points: vec![], moments: vec![], heat: HeatSummary::default(), latest: None, count: 0, first: None, last: None, now, error };
+    let empty = |error: Option<String>| Loaded { range: req.range, points: vec![], moments: vec![], heat: HeatSummary::default(), heat_score: None, latest: None, count: 0, first: None, last: None, now, error };
     let store = match Store::open(db) {
         Ok(s) => s,
         Err(e) => return empty(Some(format!("can't open the database: {e}"))),
@@ -93,6 +95,7 @@ fn load(db: &Path, req: &Request, cache: &mut Option<(Range, i64, Vec<Moment>)>)
         points: downsample(&light, 1200),
         moments,
         heat: heat_summary(&light),
+        heat_score: std::fs::read_to_string(db.with_file_name("heat-tests.jsonl")).ok().and_then(|t| t.lines().rev().find_map(bb_core::heat::parse_record)),
         latest: light.last().cloned(),
         count: stats.map_or(0, |s| s.samples),
         first: stats.and_then(|s| s.first_ts),
@@ -859,6 +862,9 @@ fn resource(app: &App, ui: &mut egui::Ui, p: &Pal, res: Res, actions: &mut Vec<A
         return;
     }
     let span = (d.now - app.chart_range.secs(), d.now);
+    if res == Res::Heat {
+        heat_score_card(ui, p, d);
+    }
     if res == Res::Heat && d.points.iter().all(|x| x.temp.is_none() && x.gpu_temp.is_none()) {
         heat_details(ui, p, d, span);
         return;
@@ -890,6 +896,34 @@ fn resource(app: &App, ui: &mut egui::Ui, p: &Pal, res: Res, actions: &mut Vec<A
     if res == Res::Heat {
         heat_details(ui, p, d, span);
     }
+}
+
+fn heat_score_card(ui: &mut egui::Ui, p: &Pal, d: &Loaded) {
+    card_frame(p).show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        match d.heat_score {
+            Some((ts, score)) => {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(format!("{score}")).font(bold(28.0)));
+                    ui.label(RichText::new("/ 100").color(p.sub));
+                    ui.add_space(8.0);
+                    let (bg, fg) = match score {
+                        70.. => (p.ok_bg, p.ok),
+                        50..=69 => (p.side, p.sub),
+                        30..=49 => (p.warn_bg, p.warn),
+                        _ => (p.bad_bg, p.bad),
+                    };
+                    chip(ui, bg, fg, bb_core::heat::band(score));
+                });
+                sub(ui, p, format!("Heat score from the test on {}. Run `bb heat test` again to see if it changed.", axis_label(ts)));
+            }
+            None => {
+                ui.label(RichText::new("How good is this machine's cooling?").font(bold(15.0)));
+                sub(ui, p, "Run `bb heat test` in a terminal: a fixed 3-minute full load that scores cooling from 0 to 100. Fans get loud.");
+            }
+        }
+    });
+    ui.add_space(12.0);
 }
 
 fn heat_details(ui: &mut egui::Ui, p: &Pal, d: &Loaded, span: (i64, i64)) {

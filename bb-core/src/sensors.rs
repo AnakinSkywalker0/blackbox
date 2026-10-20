@@ -344,6 +344,7 @@ mod win {
         temp: Option<PDH_HCOUNTER>,
         page_out: Option<PDH_HCOUNTER>,
         disk_idle: Option<PDH_HCOUNTER>,
+        cpu_power: Option<PDH_HCOUNTER>,
         gpu: Option<GpuProbe>,
         gpu_next: Option<GpuProbe>,
         ticks: u64,
@@ -365,6 +366,8 @@ mod win {
                 // Every physical disk, so the busiest one counts. "_Total" averages a pinned
                 // disk with an idle one and would hide it.
                 disk_idle: add(r"\PhysicalDisk(*)\% Idle Time"),
+                // Milliwatts, from the CPU's own energy counters. No driver or admin needed.
+                cpu_power: add(r"\Energy Meter(RAPL_Package0_PKG)\Power"),
                 gpu: GpuProbe::new(),
                 gpu_next: None,
                 ticks: 0,
@@ -387,6 +390,7 @@ mod win {
                     s.freq_pct = self.freq.and_then(value).map(|v| v as f32);
                     s.page_out = self.page_out.and_then(value).map(|v| v as f32);
                     s.disk_busy = self.disk_idle.and_then(|c| busiest_disk(&array(c)));
+                    s.cpu_power_w = self.cpu_power.and_then(value).map(|mw| (mw / 1000.0) as f32).filter(|w| *w > 0.0 && *w < 1000.0);
                     let zones = self
                         .temp_hp
                         .map(array)

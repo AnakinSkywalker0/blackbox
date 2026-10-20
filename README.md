@@ -258,6 +258,21 @@ Feedback is stored in your local database only and is never sent anywhere. The v
 
 `bb start` records in the background with no terminal (it accepts the same options as `bb run`). `bb stop` stops it. Only one recorder runs per database.
 
+### `bb heat test` / `bb heat`
+
+Scores this machine's cooling from 0 to 100 with the same test on every machine: 30 s at rest, every CPU core flat out for 3 minutes, then a minute of cooling, sampled every second. Fans get loud; it takes about 4.5 minutes. Plug in first, since laptops limit power on battery.
+
+| Part | Points | What it measures |
+|---|---|---|
+| Headroom under load | 40 | Temperature over the last minute of load, against the CPU's own limit (100 C for recent Intel Core chips) |
+| Speed held | 30 | Share of rated speed the CPU kept while hot (Windows only) |
+| Idle temperature | 15 | Temperature at rest. Hot at rest usually means dust or old thermal paste |
+| Cooling down | 15 | How far it cooled in the minute after the load |
+
+The result comes with one piece of advice for the weakest part, and is saved to `heat-tests.jsonl` beside the database. `bb heat` lists past results, so you can see whether cleaning the fans or a cooling pad helped. The desktop window's Heat screen shows the latest score.
+
+The bands (Excellent, Good, Typical for a gaming laptop, Runs hot, Needs attention) are rough guides, not a ranking against other people's machines: blackbox doesn't collect anything. A shared leaderboard is on the [roadmap](ROADMAP.md).
+
 ### `bb bench`
 
 Measures blackbox's own cost on **your** machine: time per sample, share of a core, memory used. It writes to a throwaway database that is deleted afterward.

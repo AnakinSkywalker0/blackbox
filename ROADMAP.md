@@ -40,7 +40,15 @@ Status: **v0.5.1 released**, with `bb fix`, `bb blame` and the desktop window.
 | **HTML report** | People ask for help in forums with screenshots of Task Manager. | `bb report 15:40` writes one self-contained HTML file with the charts, findings and evidence, safe to attach. |
 | **JSON output** | Scripts and other tools can't use `bb why` today. | `bb why --json` with a documented, versioned schema. |
 
-## 5. Distribution and polish
+## 5. Heat leaderboard
+
+| Item | Why | Done when |
+|---|---|---|
+| **Shared heat scores** | `bb heat test` gives a 0-100 score, but "how does my laptop rank?" needs other machines' results. | `bb heat share` uploads one result (score, measurements, CPU and laptop model, nothing else) only when asked. A small public page shows the percentile overall and against the same model. blackbox stays silent otherwise. |
+| **Same-model comparison** | A Crosshair 16 HX should be compared with other Crosshair 16 HXs first. | Results are grouped by firmware model name, with enough samples before a percentile is shown. |
+| **Run the test from the window** | It's terminal-only today. | A "Run heat test" button in the Heat screen with live progress. |
+
+## 6. Distribution and polish
 
 | Item | Why | Done when |
 |---|---|---|

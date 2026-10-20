@@ -766,6 +766,7 @@ mod tests {
                 disk_latency_ms: Some(1.5),
                 page_out: Some(0.0),
                 disk_busy: Some(4.0),
+                cpu_power_w: Some(9.0),
             }
         });
         assert!(run(&w).is_empty(), "{:?}", titles(&run(&w)));

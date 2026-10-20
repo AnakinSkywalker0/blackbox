@@ -1,5 +1,6 @@
 mod blame;
 mod fix;
+mod heat;
 mod install;
 mod selftest;
 mod update;
@@ -139,6 +140,11 @@ enum Cmd {
         #[arg(long, default_value_t = 7)]
         days: i64,
     },
+    /// Score this machine's cooling: `bb heat test` runs a fixed 3-minute load; `bb heat` lists past results
+    Heat {
+        #[command(subcommand)]
+        cmd: Option<HeatCmd>,
+    },
     /// Show what has been recorded
     Status,
     /// Show which sensors (battery, temperature, GPU, disk latency) work on this machine
@@ -168,6 +174,16 @@ enum Cmd {
     },
 }
 
+#[derive(Subcommand)]
+enum HeatCmd {
+    /// Run every core flat out for 3 minutes, watch it cool, and score the cooling (about 4.5 minutes)
+    Test {
+        /// Start without asking
+        #[arg(long, short)]
+        yes: bool,
+    },
+}
+
 fn main() {
     update::clean_up_old_version();
     let cli = Cli::parse();
@@ -184,6 +200,8 @@ fn main() {
         Cmd::Feedback { verdict, note, summary, export } => feedback(&db, verdict, note.as_deref().unwrap_or(""), summary, export),
         Cmd::Fix { undo, yes, dry_run, only } => fix::run(&db, undo, yes, dry_run, &only),
         Cmd::Blame { days } => blame::run(&db, days),
+        Cmd::Heat { cmd: Some(HeatCmd::Test { yes }) } => heat::test(&db, yes),
+        Cmd::Heat { cmd: None } => heat::history(&db),
         Cmd::Status => status(&db),
         Cmd::Sensors => sensors(),
         Cmd::Selftest { only, memory } => selftest::run(&only, memory, install::running_pid(&db).is_some()),

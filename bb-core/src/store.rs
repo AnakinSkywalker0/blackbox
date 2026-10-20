@@ -237,6 +237,8 @@ impl Store {
                         disk_latency_ms: unscaled(r.get(16)?, 10.0),
                         page_out: unscaled(r.get(17)?, 1.0),
                         disk_busy: unscaled(r.get(18)?, 10.0),
+                        // Live-only reading, never stored.
+                        cpu_power_w: None,
                     },
                     procs: Vec::new(),
                 })
@@ -387,6 +389,7 @@ mod tests {
                 disk_latency_ms: Some(12.5),
                 page_out: Some(1200.0),
                 disk_busy: Some(87.5),
+                cpu_power_w: None,
             },
             procs: vec![ProcRow {
                 name: "chrome.exe".into(),

@@ -557,12 +557,15 @@ mod tests {
         let me = std::process::id();
         let exe = std::env::current_exe().unwrap().file_name().unwrap().to_string_lossy().into_owned();
         let mine = || platform::mem_pids_named(&exe).into_iter().find(|(p, _)| *p == me).map(|x| x.1);
-        assert_eq!(mine(), Some(MEM_NORMAL));
+        // CI runners may start processes at low memory priority, so start from wherever it is.
+        let start = mine().expect("own process is visible");
         let a = Action::MemPriority { name: "self".into(), pids: vec![(me, MEM_NORMAL)] };
-        platform::apply(&a).unwrap();
-        assert_eq!(mine(), Some(MEM_LOW));
         platform::revert(&a).unwrap();
         assert_eq!(mine(), Some(MEM_NORMAL));
+        platform::apply(&a).unwrap();
+        assert_eq!(mine(), Some(MEM_LOW));
+        platform::revert(&Action::MemPriority { name: "self".into(), pids: vec![(me, start)] }).unwrap();
+        assert_eq!(mine(), Some(start));
     }
 
     #[test]

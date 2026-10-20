@@ -2,7 +2,7 @@
 
 What's planned for blackbox, with the reason for each item and how to tell when it's done. Items are sized to fit in one focused piece of work. Shipped work is listed in the [README](README.md#roadmap) and in the [releases](https://github.com/AnakinSkywalker0/blackbox/releases).
 
-Status: **v0.5.0 released**, with `bb fix`, `bb blame` and the desktop window.
+Status: **v0.5.1 released**, with `bb fix`, `bb blame` and the desktop window.
 
 ---
 

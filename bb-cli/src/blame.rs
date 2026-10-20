@@ -1,8 +1,9 @@
 //! `bb blame`: who is costing you heat, battery and CPU, and what changed lately.
 
 use bb_core::blame::{changes, tally, Change, Cost, Tally};
+use bb_core::memory::leaks;
 use bb_core::store::Store;
-use chrono::Local;
+use chrono::{Local, TimeZone};
 use std::path::Path;
 
 type Res = Result<(), String>;
@@ -52,6 +53,26 @@ pub fn run(db: &Path, days: i64) -> Res {
     println!("\nWho holds the most memory (average while running):");
     for c in by_mem.into_iter().take(5) {
         println!("  {:<28} {:>6.0} MB", c.name, c.avg_mem_mb);
+    }
+
+    println!("\nMemory that keeps growing (possible leaks):");
+    let leaks = leaks(&all);
+    if leaks.is_empty() {
+        println!("  None. No program's memory climbed steadily for an hour or more.");
+    }
+    for l in leaks.iter().take(5) {
+        println!(
+            "  {:<28} {:.0} MB -> {:.0} MB over {} (about {:.0} MB an hour), since {}",
+            l.name,
+            l.start_mb,
+            l.end_mb,
+            hours((l.to_ts - l.from_ts) as f64),
+            l.mb_per_hour(),
+            Local.timestamp_opt(l.from_ts, 0).single().map_or_else(String::new, |t| t.format("%a %H:%M").to_string())
+        );
+    }
+    if !leaks.is_empty() {
+        println!("  Restarting a leaking program gives the memory back. If it keeps happening, check for an update.");
     }
 
     // What changed: the last 24 hours against the days before.

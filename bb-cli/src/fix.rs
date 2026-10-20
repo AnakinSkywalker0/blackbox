@@ -1,7 +1,10 @@
 //! `bb fix`: turn a diagnosis into safe, reversible actions, and measure the effect.
 //!
-//! Three kinds of action, none needing administrator rights:
+//! Four kinds of action, none needing administrator rights:
 //!   * lower the priority of a program that is hogging the CPU (so everything else stays responsive),
+//!   * when memory is short, lower the memory priority of a big background program, so Windows
+//!     pages it out before the app you are using (it frees nothing by itself, and nothing is
+//!     "cleaned": forcing memory out only moves it to the slower pagefile),
 //!   * leave the Power saver plan when plugged in,
 //!   * turn off a start-at-login entry (the same switch Task Manager uses).
 //!
@@ -27,6 +30,13 @@ const PROTECTED: &[&str] = &[
 const HOG_PCT: f32 = 15.0;
 const BELOW_NORMAL: u32 = 0x4000;
 const NORMAL: u32 = 0x20;
+/// Memory priorities (MEMORY_PRIORITY_*): Windows trims and pages out lower ones first.
+const MEM_LOW: u32 = 2;
+const MEM_NORMAL: u32 = 5;
+/// Memory must be at least this full before a memory-priority change is worth proposing.
+const MEM_FULL_PCT: f32 = 80.0;
+/// And a program must hold at least this much to be worth it.
+const MEM_HOG_MB: f64 = 1024.0;
 
 pub const POWER_SAVER: &str = "a1841308-3541-4fab-bc81-f71556f20b4a";
 pub const BALANCED: &str = "381b4222-f694-41f0-9685-ff5bb260df2e";
@@ -38,6 +48,8 @@ pub const BALANCED: &str = "381b4222-f694-41f0-9685-ff5bb260df2e";
 pub enum Action {
     /// Every process of the program, with the priority class each had before.
     Priority { name: String, pids: Vec<(u32, u32)> },
+    /// Every process of the program, with the memory priority each had before.
+    MemPriority { name: String, pids: Vec<(u32, u32)> },
     PowerPlan { old_guid: String, old_name: String, new_guid: String, new_name: String },
     Startup { name: String },
 }
@@ -48,6 +60,12 @@ pub struct Measure {
     pub freq_pct: Option<f32>,
     /// Program name and its average share of total CPU, biggest first.
     pub top: Vec<(String, f32)>,
+    /// Share of RAM in use.
+    #[serde(default)]
+    pub mem_pct: f32,
+    /// Program name and its average memory in MB, biggest first.
+    #[serde(default)]
+    pub top_mem: Vec<(String, f64)>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -83,6 +101,20 @@ pub fn pick_hogs(top: &[(String, f32)]) -> Vec<(String, f32)> {
     top.iter().filter(|(n, c)| *c >= HOG_PCT && !is_protected(n)).take(2).cloned().collect()
 }
 
+/// Big programs worth letting Windows page out first: only when memory is short, never the
+/// program you are using right now, and never a protected one. Biggest first, at most two.
+pub fn pick_mem_hogs(mem_pct: f32, top_mem: &[(String, f64)], foreground: Option<&str>) -> Vec<(String, f64)> {
+    if mem_pct < MEM_FULL_PCT {
+        return Vec::new();
+    }
+    top_mem
+        .iter()
+        .filter(|(n, mb)| *mb >= MEM_HOG_MB && !is_protected(n) && !foreground.is_some_and(|f| f.eq_ignore_ascii_case(n)))
+        .take(2)
+        .cloned()
+        .collect()
+}
+
 /// Parses `Power Scheme GUID: 381b4222-...  (Balanced)` from `powercfg /getactivescheme`.
 pub fn parse_power_scheme(out: &str) -> Option<(String, String)> {
     let after = out.split("GUID:").nth(1)?.trim();
@@ -114,6 +146,9 @@ pub fn startup_approved(enabled: bool) -> Vec<u8> {
 
 pub fn describe_delta(before: &Measure, after: &Measure) -> Vec<String> {
     let mut out = vec![format!("whole machine CPU: {:.0}% -> {:.0}%", before.cpu_pct, after.cpu_pct)];
+    if before.mem_pct > 0.0 {
+        out.push(format!("memory in use: {:.0}% -> {:.0}%", before.mem_pct, after.mem_pct));
+    }
     if let (Some(a), Some(b)) = (before.freq_pct, after.freq_pct) {
         out.push(format!("CPU speed: {a:.0}% -> {b:.0}% of rated maximum"));
     }
@@ -133,14 +168,32 @@ fn measure(secs: u64) -> Measure {
     let n = samples.len().max(1) as f32;
     let freq: Vec<f32> = samples.iter().filter_map(|s| s.sensors.freq_pct).collect();
     let mut by_name: Vec<(String, f32)> = Vec::new();
-    for row in samples.iter().flat_map(|s| s.procs.iter()) {
-        add_row(&mut by_name, row, n);
+    let mut by_mem: Vec<(String, f64)> = Vec::new();
+    for s in &samples {
+        // Each program once per sample: a row can appear in several of the top lists.
+        let mut seen: Vec<&str> = Vec::new();
+        for row in &s.procs {
+            if seen.contains(&row.name.as_str()) {
+                continue;
+            }
+            seen.push(&row.name);
+            add_row(&mut by_name, row, n);
+            let mb = row.mem_bytes as f64 / 1_048_576.0 / f64::from(n);
+            match by_mem.iter_mut().find(|(name, _)| *name == row.name) {
+                Some(e) => e.1 += mb,
+                None => by_mem.push((row.name.clone(), mb)),
+            }
+        }
     }
     by_name.sort_by(|a, b| b.1.total_cmp(&a.1));
+    by_mem.sort_by(|a, b| b.1.total_cmp(&a.1));
+    let mem_pct = samples.iter().map(|s| if s.mem_total == 0 { 0.0 } else { s.mem_used as f32 * 100.0 / s.mem_total as f32 }).sum::<f32>() / n;
     Measure {
         cpu_pct: samples.iter().map(|s| s.cpu_pct).sum::<f32>() / n,
         freq_pct: (!freq.is_empty()).then(|| freq.iter().sum::<f32>() / freq.len() as f32),
         top: by_name,
+        mem_pct,
+        top_mem: by_mem,
     }
 }
 
@@ -189,6 +242,21 @@ pub fn run(db: &Path, undo: bool, yes: bool, dry_run: bool, only: &[String]) -> 
             });
         }
     }
+    let foreground = platform::foreground_name();
+    for (name, mb) in pick_mem_hogs(before.mem_pct, &before.top_mem, foreground.as_deref()) {
+        let pids: Vec<(u32, u32)> = platform::mem_pids_named(&name).into_iter().filter(|(_, p)| *p == MEM_NORMAL).collect();
+        if !pids.is_empty() {
+            proposals.push(Proposal {
+                text: format!(
+                    "Let Windows page out {name} first: it holds {:.1} GB in the background while memory is {:.0}% full, so the app you're using keeps its RAM",
+                    mb / 1024.0,
+                    before.mem_pct
+                ),
+                action: Action::MemPriority { name: name.clone(), pids },
+                optional: false,
+            });
+        }
+    }
     if let Some(a) = plan_power(platform::active_power_plan(), platform::on_ac()) {
         proposals.push(Proposal { action: a, text: "Switch from Power saver to Balanced; you're plugged in, and Power saver caps CPU speed".into(), optional: false });
     }
@@ -199,6 +267,7 @@ pub fn run(db: &Path, undo: bool, yes: bool, dry_run: bool, only: &[String]) -> 
         true => !p.optional,
         false => only.iter().any(|o| match &p.action {
             Action::Priority { .. } => o == "priority",
+            Action::MemPriority { .. } => o == "memory",
             Action::PowerPlan { .. } => o == "power",
             Action::Startup { .. } => o == "startup",
         }),
@@ -206,7 +275,7 @@ pub fn run(db: &Path, undo: bool, yes: bool, dry_run: bool, only: &[String]) -> 
     proposals.retain(wanted);
 
     if proposals.is_empty() {
-        println!("Nothing worth changing right now: no program is hogging the CPU, and the power plan is fine.");
+        println!("Nothing worth changing right now: no program is hogging the CPU, no big background program while memory is short, and the power plan is fine.");
         println!("Tip: `bb fix --only startup` lists start-at-login entries you can turn off.");
         return Ok(());
     }
@@ -241,7 +310,9 @@ pub fn run(db: &Path, undo: bool, yes: bool, dry_run: bool, only: &[String]) -> 
         println!("  {line}");
     }
     println!("\nThe numbers depend on what you were doing in those two windows. Lowering priority shifts CPU");
-    println!("toward your other programs; it doesn't make the busy program use less. Power plan changes show");
+    println!("toward your other programs; it doesn't make the busy program use less. Memory priority frees");
+    println!("nothing by itself: it decides who gets paged out first when memory runs short, so the effect is");
+    println!("your active app staying fast, not a bigger free-memory number. Power plan changes show");
     println!("up in CPU speed. Start-at-login changes take effect next time you sign in.");
     let mut log = read_log(db);
     log.push(Batch { ts: chrono::Local::now().timestamp(), actions: done, before, after: Some(after) });
@@ -328,6 +399,62 @@ mod platform {
         }
     }
 
+    /// Every process called `name`, with its current memory priority.
+    pub fn mem_pids_named(name: &str) -> Vec<(u32, u32)> {
+        use sysinfo::{ProcessesToUpdate, System};
+        let mut sys = System::new();
+        sys.refresh_processes(ProcessesToUpdate::All, true);
+        sys.processes().iter().filter(|(_, p)| p.name().to_string_lossy().eq_ignore_ascii_case(name)).filter_map(|(pid, _)| get_mem_priority(pid.as_u32()).map(|c| (pid.as_u32(), c))).collect()
+    }
+
+    fn get_mem_priority(pid: u32) -> Option<u32> {
+        use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::System::Threading::{GetProcessInformation, OpenProcess, ProcessMemoryPriority, MEMORY_PRIORITY_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION};
+        unsafe {
+            let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+            if h.is_null() {
+                return None;
+            }
+            let mut info = MEMORY_PRIORITY_INFORMATION { MemoryPriority: 0 };
+            let ok = GetProcessInformation(h, ProcessMemoryPriority, &mut info as *mut _ as *mut _, std::mem::size_of::<MEMORY_PRIORITY_INFORMATION>() as u32) != 0;
+            CloseHandle(h);
+            ok.then_some(info.MemoryPriority)
+        }
+    }
+
+    fn set_mem_priority(pid: u32, priority: u32) -> Res {
+        use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::System::Threading::{OpenProcess, ProcessMemoryPriority, SetProcessInformation, MEMORY_PRIORITY_INFORMATION, PROCESS_SET_INFORMATION};
+        unsafe {
+            let h = OpenProcess(PROCESS_SET_INFORMATION, 0, pid);
+            if h.is_null() {
+                return Err(format!("pid {pid} is gone or protected"));
+            }
+            let info = MEMORY_PRIORITY_INFORMATION { MemoryPriority: priority };
+            let ok = SetProcessInformation(h, ProcessMemoryPriority, &info as *const _ as *const _, std::mem::size_of::<MEMORY_PRIORITY_INFORMATION>() as u32) != 0;
+            CloseHandle(h);
+            if ok { Ok(()) } else { Err(format!("Windows refused to change pid {pid}")) }
+        }
+    }
+
+    /// The program that owns the window you are using right now.
+    pub fn foreground_name() -> Option<String> {
+        use sysinfo::{Pid, ProcessesToUpdate, System};
+        use windows_sys::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId};
+        let mut pid = 0u32;
+        unsafe {
+            let w = GetForegroundWindow();
+            if w.is_null() {
+                return None;
+            }
+            GetWindowThreadProcessId(w, &mut pid);
+        }
+        let p = Pid::from_u32(pid);
+        let mut sys = System::new();
+        sys.refresh_processes(ProcessesToUpdate::Some(&[p]), true);
+        sys.process(p).map(|x| x.name().to_string_lossy().into_owned())
+    }
+
     pub fn enabled_startup_items() -> Vec<String> {
         let hk = RegKey::predef(HKEY_CURRENT_USER);
         let Ok(run) = hk.open_subkey_with_flags(RUN, KEY_READ) else { return Vec::new() };
@@ -351,6 +478,10 @@ mod platform {
                 let ok = pids.iter().filter(|(pid, _)| set_class(*pid, BELOW_NORMAL).is_ok()).count();
                 if ok == 0 { Err("Windows refused every process".into()) } else { Ok(()) }
             }
+            Action::MemPriority { pids, .. } => {
+                let ok = pids.iter().filter(|(pid, _)| set_mem_priority(*pid, MEM_LOW).is_ok()).count();
+                if ok == 0 { Err("Windows refused every process".into()) } else { Ok(()) }
+            }
             Action::PowerPlan { new_guid, .. } => powercfg(&["/setactive", new_guid]).map(|_| ()),
             Action::Startup { name } => set_startup(name, false),
         }
@@ -362,6 +493,11 @@ mod platform {
                 let ok = pids.iter().filter(|(pid, old)| set_class(*pid, *old).is_ok()).count();
                 let gone = if ok < pids.len() { "; the rest have exited" } else { "" };
                 Ok(format!("restored the priority of {ok} of {} {name} process(es){gone}", pids.len()))
+            }
+            Action::MemPriority { name, pids } => {
+                let ok = pids.iter().filter(|(pid, old)| set_mem_priority(*pid, *old).is_ok()).count();
+                let gone = if ok < pids.len() { "; the rest have exited" } else { "" };
+                Ok(format!("restored the memory priority of {ok} of {} {name} process(es){gone}", pids.len()))
             }
             Action::PowerPlan { old_guid, old_name, .. } => powercfg(&["/setactive", old_guid]).map(|_| format!("switched back to {old_name}")),
             Action::Startup { name } => set_startup(name, true).map(|_| format!("\"{name}\" will start at login again")),
@@ -376,6 +512,8 @@ mod platform {
     pub fn active_power_plan() -> Option<(String, String)> { None }
     pub fn on_ac() -> Option<bool> { None }
     pub fn pids_named(_: &str) -> Vec<(u32, u32)> { Vec::new() }
+    pub fn mem_pids_named(_: &str) -> Vec<(u32, u32)> { Vec::new() }
+    pub fn foreground_name() -> Option<String> { None }
     pub fn enabled_startup_items() -> Vec<String> { Vec::new() }
     pub fn apply(_: &Action) -> Res { Err("unsupported".into()) }
     pub fn revert(_: &Action) -> Result<String, String> { Err("unsupported".into()) }
@@ -396,6 +534,35 @@ mod tests {
         assert_eq!(names, ["chrome.exe", "build.exe"], "system programs are skipped, and at most two are picked");
         assert!(pick_hogs(&top(&[("a.exe", 14.9)])).is_empty());
         assert!(is_protected("EXPLORER.EXE") && is_protected("bb.exe"));
+    }
+
+    fn mem(v: &[(&str, f64)]) -> Vec<(String, f64)> {
+        v.iter().map(|(n, m)| (n.to_string(), *m)).collect()
+    }
+
+    #[test]
+    fn memory_hogs_are_only_picked_when_memory_is_short() {
+        let top = mem(&[("Unity.exe", 2600.0), ("chrome.exe", 1900.0), ("explorer.exe", 1500.0), ("code.exe", 1200.0), ("small.exe", 300.0)]);
+        assert!(pick_mem_hogs(70.0, &top, None).is_empty(), "plenty of free memory: leave everything alone");
+        let names = |v: Vec<(String, f64)>| v.into_iter().map(|(n, _)| n).collect::<Vec<_>>();
+        assert_eq!(names(pick_mem_hogs(92.0, &top, None)), ["Unity.exe", "chrome.exe"]);
+        assert_eq!(names(pick_mem_hogs(92.0, &top, Some("unity.exe"))), ["chrome.exe", "code.exe"], "the app in use is never demoted, nor protected ones");
+        assert!(pick_mem_hogs(95.0, &mem(&[("small.exe", 900.0)]), None).is_empty(), "under 1 GB isn't worth it");
+    }
+
+    /// The real Windows calls, on this test's own process only.
+    #[cfg(windows)]
+    #[test]
+    fn memory_priority_can_be_lowered_and_restored() {
+        let me = std::process::id();
+        let exe = std::env::current_exe().unwrap().file_name().unwrap().to_string_lossy().into_owned();
+        let mine = || platform::mem_pids_named(&exe).into_iter().find(|(p, _)| *p == me).map(|x| x.1);
+        assert_eq!(mine(), Some(MEM_NORMAL));
+        let a = Action::MemPriority { name: "self".into(), pids: vec![(me, MEM_NORMAL)] };
+        platform::apply(&a).unwrap();
+        assert_eq!(mine(), Some(MEM_LOW));
+        platform::revert(&a).unwrap();
+        assert_eq!(mine(), Some(MEM_NORMAL));
     }
 
     #[test]
@@ -426,12 +593,13 @@ mod tests {
 
     #[test]
     fn the_before_after_report_names_each_change() {
-        let before = Measure { cpu_pct: 80.0, freq_pct: Some(50.0), top: top(&[("build.exe", 60.0), ("code.exe", 5.0)]) };
-        let after = Measure { cpu_pct: 70.0, freq_pct: Some(90.0), top: top(&[("code.exe", 8.0)]) };
+        let before = Measure { cpu_pct: 80.0, freq_pct: Some(50.0), top: top(&[("build.exe", 60.0), ("code.exe", 5.0)]), mem_pct: 91.0, ..Default::default() };
+        let after = Measure { cpu_pct: 70.0, freq_pct: Some(90.0), top: top(&[("code.exe", 8.0)]), mem_pct: 88.0, ..Default::default() };
         let lines = describe_delta(&before, &after);
         assert_eq!(lines[0], "whole machine CPU: 80% -> 70%");
-        assert_eq!(lines[1], "CPU speed: 50% -> 90% of rated maximum");
-        assert_eq!(lines[2], "build.exe: 60% -> 0% of the CPU");
+        assert_eq!(lines[1], "memory in use: 91% -> 88%");
+        assert_eq!(lines[2], "CPU speed: 50% -> 90% of rated maximum");
+        assert_eq!(lines[3], "build.exe: 60% -> 0% of the CPU");
     }
 
     #[test]
@@ -440,6 +608,7 @@ mod tests {
             ts: 5,
             actions: vec![
                 Action::Priority { name: "a.exe".into(), pids: vec![(7, NORMAL)] },
+                Action::MemPriority { name: "b.exe".into(), pids: vec![(9, MEM_NORMAL)] },
                 Action::Startup { name: "Thing".into() },
             ],
             before: Measure::default(),

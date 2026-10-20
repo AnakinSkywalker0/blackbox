@@ -22,7 +22,7 @@ The capture above is real and unstaged. It was taken during a release build of b
 - **Small and cheap.** About 2% of one core and 40 MB of RAM on Windows. Old data is thinned automatically, so a week of history is about 140 MB.
 - **Easy to install and update.** One-line installers, a Windows installer, Scoop, and `bb update` with checksum verification. About 135 automated tests run on Windows, Linux and macOS in CI.
 
-> **Status: v0.5.0**, with a desktop window. Runs on Windows, Linux and macOS. Windows has the most sensors. See [Limits](#limits-read-this) before trusting it blindly, and the [roadmap](ROADMAP.md) for what's next.
+> **Status: v0.5.1**, with a desktop window. Runs on Windows, Linux and macOS. Windows has the most sensors. See [Limits](#limits-read-this) before trusting it blindly, and the [roadmap](ROADMAP.md) for what's next.
 
 ---
 
@@ -272,8 +272,8 @@ The Windows installer and `bb update` include the desktop window. On Linux and m
 
 | Command | What it does |
 |---|---|
-| `bb blame [--days 7]` | Which programs cost you the most heat, battery and CPU over your history, and what got heavier lately. Needs a day or two of recording |
-| `bb fix` | Proposes safe, reversible fixes (lower a CPU hog's priority, leave Power saver, trim start-at-login entries with `--only startup`), asks before each one, and measures the effect. `--dry-run` only shows them, and `--undo` reverses the last batch |
+| `bb blame [--days 7]` | Which programs cost you the most heat, battery and CPU over your history, what got heavier lately, and which programs look like they are leaking memory (climbing steadily for an hour or more without coming back down). Needs a day or two of recording |
+| `bb fix` | Proposes safe, reversible fixes, asks before each one, and measures the effect: lower a CPU hog's priority; when memory is 80%+ full, lower the memory priority of a big background program so Windows pages it out before the app you're using; leave Power saver; trim start-at-login entries with `--only startup`. `--dry-run` only shows them, and `--undo` reverses the last batch. It never "cleans" RAM: forcing memory out of programs only moves it to the slower pagefile |
 | `bb-gui` | A desktop window laid out like a status page. Home says how the computer is doing right now, shows a 24-hour strip with slowdowns marked, and lists each slowdown as a card. Click one for the plain-English explanation, evidence, what you can do, and Yes/Partly/No feedback. The sidebar has a chart each for CPU, memory, disk, GPU and heat (with time spent over 80 and 90 C), plus Sensors. It follows the system light or dark mode. The installer adds Start-menu and desktop shortcuts |
 
 ---

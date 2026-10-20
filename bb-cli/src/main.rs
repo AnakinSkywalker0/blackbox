@@ -129,7 +129,7 @@ enum Cmd {
         /// Only show what would be changed
         #[arg(long)]
         dry_run: bool,
-        /// Limit to these kinds: priority, power, startup (startup is only offered when named)
+        /// Limit to these kinds: priority, memory, power, startup (startup is only offered when named)
         #[arg(long, value_delimiter = ',')]
         only: Vec<String>,
     },

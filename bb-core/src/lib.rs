@@ -1,6 +1,7 @@
 //! blackbox engine: sampler, storage, rule engine and time parsing.
 
 pub mod blame;
+pub mod memory;
 pub mod model;
 pub mod rules;
 pub mod sampler;

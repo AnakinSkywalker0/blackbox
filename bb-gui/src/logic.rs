@@ -70,6 +70,8 @@ pub struct Point {
     pub gpu_temp: Option<f64>,
     /// Lowest CPU speed in the bucket (percent of rated), so a throttling dip stays visible.
     pub freq: Option<f64>,
+    /// Highest CPU package power in the bucket, in watts.
+    pub power: Option<f64>,
 }
 
 fn mem_pct(s: &Sample) -> f64 {
@@ -103,6 +105,7 @@ pub fn downsample(samples: &[Sample], max_points: usize) -> Vec<Point> {
                 temp: max_opt(c.iter().map(|s| s.sensors.temp_c)),
                 gpu_temp: max_opt(c.iter().map(|s| s.sensors.gpu_temp_c)),
                 freq: min_opt(c.iter().map(|s| s.sensors.freq_pct)),
+                power: max_opt(c.iter().map(|s| s.sensors.cpu_power_w)),
             }
         })
         .collect()

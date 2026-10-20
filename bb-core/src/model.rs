@@ -43,7 +43,7 @@ pub struct Sensors {
     /// shows as Disk %). Unlike throughput it means the same on a slow disk and a fast one.
     pub disk_busy: Option<f32>,
     /// Power the CPU package is drawing, in watts, from the chip's own energy counters (Intel
-    /// RAPL, Windows only). Live readings only: not stored in the database.
+    /// RAPL, Windows only).
     pub cpu_power_w: Option<f32>,
 }
 

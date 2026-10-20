@@ -10,8 +10,8 @@ pub const THIN_STEP_SECS: i64 = 10;
 
 /// Nullable columns added in schema v1. NULL means the sensor was unavailable.
 /// Scaled integers keep rows small: temps, gpu and frequency x10, queue x100.
-const SENSOR_COLUMNS: [&str; 12] =
-    ["ac", "batt", "saver", "temp", "fpct", "gpu", "gtemp", "gthr", "dq", "dlat", "pgo", "dbusy"];
+const SENSOR_COLUMNS: [&str; 13] =
+    ["ac", "batt", "saver", "temp", "fpct", "gpu", "gtemp", "gthr", "dq", "dlat", "pgo", "dbusy", "cpuw"];
 
 fn scaled(v: Option<f32>, k: f32) -> Option<i64> {
     v.map(|x| (x * k).round() as i64)
@@ -121,7 +121,7 @@ impl Store {
     /// Adds sensor columns to databases created by older versions.
     fn migrate(conn: &Connection) -> rusqlite::Result<()> {
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-        if version < 3 {
+        if version < 4 {
             let have: Vec<String> = conn
                 .prepare("SELECT name FROM pragma_table_info('samples')")?
                 .query_map([], |r| r.get(0))?
@@ -131,7 +131,7 @@ impl Store {
                     conn.execute_batch(&format!("ALTER TABLE samples ADD COLUMN {col} INTEGER"))?;
                 }
             }
-            conn.execute_batch("PRAGMA user_version = 3")?;
+            conn.execute_batch("PRAGMA user_version = 4")?;
         }
         Ok(())
     }
@@ -154,8 +154,8 @@ impl Store {
         let x = &s.sensors;
         tx.execute(
             "INSERT OR REPLACE INTO samples
-             (ts,cpu,mem_used,mem_total,swap_used,mhz,disk,ac,batt,saver,temp,fpct,gpu,gtemp,gthr,dq,dlat,pgo,dbusy)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19)",
+             (ts,cpu,mem_used,mem_total,swap_used,mhz,disk,ac,batt,saver,temp,fpct,gpu,gtemp,gthr,dq,dlat,pgo,dbusy,cpuw)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20)",
             params![
                 s.ts,
                 (s.cpu_pct * 10.0).round() as i64,
@@ -176,6 +176,7 @@ impl Store {
                 scaled(x.disk_latency_ms, 10.0),
                 scaled(x.page_out, 1.0),
                 scaled(x.disk_busy, 10.0),
+                scaled(x.cpu_power_w, 10.0),
             ],
         )?;
         {
@@ -211,7 +212,7 @@ impl Store {
         const MIB: u64 = 1024 * 1024;
         let mut st = self.conn.prepare_cached(
             "SELECT ts,cpu,mem_used,mem_total,swap_used,mhz,disk,
-                    ac,batt,saver,temp,fpct,gpu,gtemp,gthr,dq,dlat,pgo,dbusy FROM samples
+                    ac,batt,saver,temp,fpct,gpu,gtemp,gthr,dq,dlat,pgo,dbusy,cpuw FROM samples
              WHERE ts BETWEEN ?1 AND ?2 ORDER BY ts",
         )?;
         let mut out: Vec<Sample> = st
@@ -237,8 +238,7 @@ impl Store {
                         disk_latency_ms: unscaled(r.get(16)?, 10.0),
                         page_out: unscaled(r.get(17)?, 1.0),
                         disk_busy: unscaled(r.get(18)?, 10.0),
-                        // Live-only reading, never stored.
-                        cpu_power_w: None,
+                        cpu_power_w: unscaled(r.get(19)?, 10.0),
                     },
                     procs: Vec::new(),
                 })
@@ -389,7 +389,7 @@ mod tests {
                 disk_latency_ms: Some(12.5),
                 page_out: Some(1200.0),
                 disk_busy: Some(87.5),
-                cpu_power_w: None,
+                cpu_power_w: Some(54.5),
             },
             procs: vec![ProcRow {
                 name: "chrome.exe".into(),

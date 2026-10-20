@@ -136,6 +136,7 @@ enum Res {
     Disk,
     Gpu,
     Heat,
+    Power,
 }
 
 impl Res {
@@ -146,6 +147,30 @@ impl Res {
             Res::Disk => "Disk",
             Res::Gpu => "GPU",
             Res::Heat => "Heat",
+            Res::Power => "Power",
+        }
+    }
+
+    fn icon(self) -> Icon {
+        match self {
+            Res::Cpu => Icon::Cpu,
+            Res::Memory => Icon::Memory,
+            Res::Disk => Icon::Disk,
+            Res::Gpu => Icon::Gpu,
+            Res::Heat => Icon::Heat,
+            Res::Power => Icon::Power,
+        }
+    }
+
+    /// Each section's colour, used for its icon, card accent and chart line.
+    fn color(self, p: &Pal) -> Color32 {
+        match self {
+            Res::Cpu => p.chart[0],
+            Res::Memory => p.chart[1],
+            Res::Disk => p.sub,
+            Res::Gpu => p.purple,
+            Res::Heat => p.chart[3],
+            Res::Power => p.chart[2],
         }
     }
 }
@@ -346,6 +371,9 @@ mod theme {
         pub bad: Color32,
         pub bad_bg: Color32,
         pub chart: [Color32; 4],
+        pub purple: Color32,
+        /// Soft drop shadow for cards (transparent in dark mode, where borders do the work).
+        pub shadow: Color32,
     }
 
     pub fn pal(dark: bool) -> Pal {
@@ -371,6 +399,8 @@ mod theme {
                 bad: c(240, 149, 149),
                 bad_bg: c(100, 30, 30),
                 chart: [c(133, 183, 235), c(93, 202, 165), c(239, 159, 39), c(240, 149, 149)],
+                purple: c(175, 169, 236),
+                shadow: Color32::TRANSPARENT,
             }
         } else {
             Pal {
@@ -393,6 +423,8 @@ mod theme {
                 bad: c(163, 45, 45),
                 bad_bg: c(252, 235, 235),
                 chart: [c(55, 138, 221), c(29, 158, 117), c(186, 117, 23), c(226, 75, 74)],
+                purple: c(83, 74, 183),
+                shadow: Color32::from_black_alpha(14),
             }
         }
     }
@@ -505,7 +537,137 @@ fn chip(ui: &mut egui::Ui, bg: Color32, fg: Color32, text: &str) {
 }
 
 fn card_frame(p: &Pal) -> egui::Frame {
-    egui::Frame::new().fill(p.card).stroke(Stroke::new(1.0, p.border)).corner_radius(12).inner_margin(Margin::symmetric(14, 12))
+    egui::Frame::new()
+        .fill(p.card)
+        .stroke(Stroke::new(1.0, p.border))
+        .corner_radius(14)
+        .inner_margin(Margin::symmetric(16, 14))
+        .shadow(egui::Shadow { offset: [0, 2], blur: 10, spread: 0, color: p.shadow })
+}
+
+#[derive(Clone, Copy)]
+enum Icon {
+    Brand,
+    Home,
+    Cpu,
+    Memory,
+    Disk,
+    Gpu,
+    Heat,
+    Power,
+    Sensors,
+    About,
+}
+
+/// Draws a small line icon centred in `r`. Drawn with shapes rather than font symbols, so it
+/// looks the same on every machine whatever fonts are installed.
+fn paint_icon(painter: &egui::Painter, r: egui::Rect, icon: Icon, color: Color32) {
+    use egui::{pos2, Rect, Shape};
+    let c = r.center();
+    let u = r.width() / 16.0; // one unit of a 16-unit grid
+    let st = Stroke::new((1.4 * u).max(1.2), color);
+    let at = |x: f32, y: f32| pos2(c.x + x * u, c.y + y * u);
+    let rect = |x0: f32, y0: f32, x1: f32, y1: f32| Rect::from_two_pos(at(x0, y0), at(x1, y1));
+    match icon {
+        Icon::Brand => {
+            painter.rect_filled(rect(-5.5, -5.5, 5.5, 5.5), 2.0 * u, color);
+            painter.circle_filled(c, 2.0 * u, Color32::WHITE);
+        }
+        Icon::Home => {
+            painter.add(Shape::line(vec![at(-6.0, -0.5), at(0.0, -6.0), at(6.0, -0.5)], st));
+            painter.add(Shape::line(vec![at(-4.5, -1.5), at(-4.5, 5.5), at(4.5, 5.5), at(4.5, -1.5)], st));
+            painter.rect_filled(rect(-1.3, 1.5, 1.3, 5.5), 0.0, color);
+        }
+        Icon::Cpu => {
+            painter.rect_stroke(rect(-4.5, -4.5, 4.5, 4.5), 1.0 * u, st, StrokeKind::Middle);
+            painter.rect_filled(rect(-1.8, -1.8, 1.8, 1.8), 0.5 * u, color);
+            for k in [-2.5_f32, 0.0, 2.5] {
+                for (a, b) in [((k, -4.5), (k, -6.5)), ((k, 4.5), (k, 6.5)), ((-4.5, k), (-6.5, k)), ((4.5, k), (6.5, k))] {
+                    painter.line_segment([at(a.0, a.1), at(b.0, b.1)], st);
+                }
+            }
+        }
+        Icon::Memory => {
+            painter.rect_stroke(rect(-6.5, -3.5, 6.5, 2.5), 1.0 * u, st, StrokeKind::Middle);
+            for x in [-4.0_f32, -1.3, 1.3, 4.0] {
+                painter.rect_filled(rect(x - 0.8, -1.8, x + 0.8, 0.8), 0.0, color);
+            }
+            for x in [-5.0_f32, -2.5, 0.0, 2.5, 5.0] {
+                painter.line_segment([at(x, 2.5), at(x, 4.5)], st);
+            }
+        }
+        Icon::Disk => {
+            painter.circle_stroke(c, 5.8 * u, st);
+            painter.circle_filled(c, 1.6 * u, color);
+        }
+        Icon::Gpu => {
+            painter.rect_stroke(rect(-6.5, -4.0, 6.5, 4.0), 1.0 * u, st, StrokeKind::Middle);
+            painter.circle_stroke(at(-1.5, 0.0), 2.4 * u, st);
+            painter.rect_filled(rect(2.5, -1.8, 4.6, 1.8), 0.0, color);
+            painter.line_segment([at(-4.5, 4.0), at(-4.5, 6.0)], st);
+        }
+        Icon::Heat => {
+            painter.line_segment([at(0.0, -6.0), at(0.0, 2.0)], Stroke::new(3.2 * u, color));
+            painter.circle_filled(at(0.0, 3.5), 2.8 * u, color);
+            for y in [-4.0_f32, -1.5] {
+                painter.line_segment([at(2.5, y), at(4.5, y)], st);
+            }
+        }
+        Icon::Power => {
+            let bolt = [at(1.5, -7.0), at(-4.0, 1.0), at(-0.5, 1.0), at(-1.5, 7.0), at(4.0, -1.0), at(0.5, -1.0)];
+            painter.add(Shape::convex_polygon(vec![bolt[0], bolt[1], bolt[2], bolt[5]], color, Stroke::NONE));
+            painter.add(Shape::convex_polygon(vec![bolt[5], bolt[2], bolt[3], bolt[4]], color, Stroke::NONE));
+        }
+        Icon::Sensors => {
+            painter.circle_filled(c, 1.6 * u, color);
+            painter.circle_stroke(c, 3.8 * u, st);
+            painter.circle_stroke(c, 6.2 * u, Stroke::new(st.width, color.gamma_multiply(0.6)));
+        }
+        Icon::About => {
+            painter.circle_stroke(c, 6.0 * u, st);
+            painter.circle_filled(at(0.0, -3.0), 1.0 * u, color);
+            painter.line_segment([at(0.0, -0.8), at(0.0, 3.8)], Stroke::new(1.8 * u, color));
+        }
+    }
+
+}
+
+/// A rounded tile with an icon in a section's colour, for the sidebar and cards.
+fn icon_tile(ui: &mut egui::Ui, icon: Icon, color: Color32, size: f32) {
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(size, size), Sense::hover());
+    ui.painter().rect_filled(rect, size * 0.28, Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 40));
+    paint_icon(ui.painter(), rect.shrink(size * 0.2), icon, color);
+}
+
+/// Averages `values` into at most `n` points, so a mini chart stays smooth and cheap however
+/// much data there is.
+fn bucket(values: &[f64], n: usize) -> Vec<f64> {
+    if values.len() <= n {
+        return values.to_vec();
+    }
+    let size = values.len().div_ceil(n);
+    values.chunks(size).map(|c| c.iter().sum::<f64>() / c.len() as f64).collect()
+}
+
+/// A small line chart of `values` (oldest first) filling the width given, with a soft fill.
+fn sparkline(ui: &mut egui::Ui, values: &[f64], max: f64, color: Color32, height: f32) {
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), height), Sense::hover());
+    let values = bucket(values, 48);
+    if values.len() < 2 || max <= 0.0 {
+        return;
+    }
+    let pts: Vec<egui::Pos2> = values
+        .iter()
+        .enumerate()
+        .map(|(i, v)| egui::pos2(rect.left() + rect.width() * i as f32 / (values.len() - 1) as f32, rect.bottom() - rect.height() * (v / max).clamp(0.0, 1.0) as f32))
+        .collect();
+    let fill = Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 28);
+    // Filled as thin strips, since egui only fills convex shapes.
+    for w in pts.windows(2) {
+        let quad = vec![w[0], w[1], egui::pos2(w[1].x, rect.bottom()), egui::pos2(w[0].x, rect.bottom())];
+        ui.painter().add(egui::Shape::convex_polygon(quad, fill, Stroke::NONE));
+    }
+    ui.painter().add(egui::Shape::line(pts, Stroke::new(1.8, color)));
 }
 
 /// A card the whole of which can be clicked. Returns true when it was.
@@ -657,6 +819,9 @@ fn home(app: &App, ui: &mut egui::Ui, p: &Pal, actions: &mut Vec<Action>) {
         sub(ui, p, line);
     });
 
+    ui.add_space(14.0);
+    metric_cards(ui, p, d, actions);
+
     section(ui, p, "Last 24 hours");
     let slots = strip(d.now, Range::H24.secs(), 48, &d.points, &d.moments);
     let (rect, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 30.0), Sense::click());
@@ -737,6 +902,44 @@ fn home(app: &App, ui: &mut egui::Ui, p: &Pal, actions: &mut Vec<Action>) {
         }
         ui.add_space(2.0);
     }
+}
+
+/// One card per resource: its live value and the last hour as a small chart. Clicking a card
+/// opens that resource's full chart.
+fn metric_cards(ui: &mut egui::Ui, p: &Pal, d: &Loaded, actions: &mut Vec<Action>) {
+    let Some(s) = &d.latest else { return };
+    let hour: Vec<&Point> = d.points.iter().filter(|x| x.ts >= (d.now - 3600) as f64).collect();
+    let series = |f: &dyn Fn(&Point) -> Option<f64>| hour.iter().filter_map(|x| f(x)).collect::<Vec<f64>>();
+    let gb = |b: u64| b as f64 / 1_073_741_824.0;
+    let mut cards: Vec<(Res, String, Vec<f64>, f64)> = vec![
+        (Res::Cpu, format!("{:.0}%", s.cpu_pct), series(&|x| Some(x.cpu)), 100.0),
+        (Res::Memory, format!("{:.1} GB", gb(s.mem_used)), series(&|x| Some(x.mem)), 100.0),
+    ];
+    if let Some(t) = s.sensors.temp_c {
+        cards.push((Res::Heat, format!("{t:.0} C"), series(&|x| x.temp), 100.0));
+    }
+    if let Some(w) = s.sensors.cpu_power_w {
+        let pw = series(&|x| x.power);
+        let max = pw.iter().copied().fold(w as f64, f64::max).max(10.0) * 1.15;
+        cards.push((Res::Power, format!("{w:.0} W"), pw, max));
+    }
+    ui.columns(cards.len(), |cols| {
+        for (col, (res, value, values, max)) in cols.iter_mut().zip(cards) {
+            let clicked = click_card(col, p, 1000 + res as usize, |ui| {
+                ui.horizontal(|ui| {
+                    icon_tile(ui, res.icon(), res.color(p), 22.0);
+                    ui.label(RichText::new(res.label()).color(p.sub).size(13.0));
+                });
+                ui.add_space(4.0);
+                ui.label(RichText::new(value).font(bold(24.0)));
+                ui.add_space(2.0);
+                sparkline(ui, &values, max, res.color(p), 34.0);
+            });
+            if clicked {
+                actions.push(Action::Go(View::Res(res)));
+            }
+        }
+    });
 }
 
 fn detail(app: &App, ui: &mut egui::Ui, p: &Pal, actions: &mut Vec<Action>) {
@@ -837,6 +1040,7 @@ fn resource(app: &App, ui: &mut egui::Ui, p: &Pal, res: Res, actions: &mut Vec<A
         Res::Disk => format!("{:.1} MB/s", s.disk_bps as f64 / 1_048_576.0),
         Res::Gpu => s.sensors.gpu_pct.map_or("not available".into(), |g| format!("{g:.0}%")),
         Res::Heat => s.sensors.temp_c.map_or("not available".into(), |t| format!("{t:.0} C")),
+        Res::Power => s.sensors.cpu_power_w.map_or("not available".into(), |w| format!("{w:.0} W")),
     });
     ui.horizontal(|ui| {
         ui.vertical(|ui| {
@@ -869,20 +1073,28 @@ fn resource(app: &App, ui: &mut egui::Ui, p: &Pal, res: Res, actions: &mut Vec<A
         heat_details(ui, p, d, span);
         return;
     }
+    if res == Res::Power && d.points.iter().all(|x| x.power.is_none()) {
+        sub(ui, p, "No CPU power history yet. It needs Windows and a recorder from blackbox 0.5.2 or later; the chart fills in as it records.");
+        return;
+    }
     if res == Res::Gpu && d.points.iter().all(|x| x.gpu.is_none()) {
         sub(ui, p, "This computer doesn't report GPU load.");
         return;
     }
-    let [c0, c1, c2, c3] = p.chart;
+    let [c0, _, _, c3] = p.chart;
     let h = if res == Res::Heat { (ui.available_height() * 0.38).clamp(140.0, 260.0) } else { (ui.available_height() - 90.0).clamp(160.0, 420.0) };
     let clicked = match res {
-        Res::Cpu => chart(ui, p, "cpu", "%", h, 100.0, span, lines("CPU", c0, &d.points, |x| Some(x.cpu)), &d.moments, &[]),
-        Res::Memory => chart(ui, p, "mem", "%", h, 100.0, span, lines("Memory used", c1, &d.points, |x| Some(x.mem)), &d.moments, &[]),
+        Res::Cpu => chart(ui, p, "cpu", "%", h, 100.0, span, lines("CPU", res.color(p), &d.points, |x| Some(x.cpu)), &d.moments, &[]),
+        Res::Memory => chart(ui, p, "mem", "%", h, 100.0, span, lines("Memory used", res.color(p), &d.points, |x| Some(x.mem)), &d.moments, &[]),
+        Res::Power => {
+            let max = d.points.iter().filter_map(|x| x.power).fold(20.0, f64::max) * 1.15;
+            chart(ui, p, "power", " W", h, max, span, lines("CPU package", res.color(p), &d.points, |x| x.power), &d.moments, &[])
+        }
         Res::Disk => {
             let max = d.points.iter().map(|x| x.disk_mb).fold(10.0, f64::max) * 1.1;
-            chart(ui, p, "disk", " MB/s", h, max, span, lines("Disk", c2, &d.points, |x| Some(x.disk_mb)), &d.moments, &[])
+            chart(ui, p, "disk", " MB/s", h, max, span, lines("Disk", res.color(p), &d.points, |x| Some(x.disk_mb)), &d.moments, &[])
         }
-        Res::Gpu => chart(ui, p, "gpu", "%", h, 100.0, span, lines("GPU", c0, &d.points, |x| x.gpu), &d.moments, &[]),
+        Res::Gpu => chart(ui, p, "gpu", "%", h, 100.0, span, lines("GPU", res.color(p), &d.points, |x| x.gpu), &d.moments, &[]),
         Res::Heat => {
             let tmax = d.points.iter().flat_map(|x| [x.temp, x.gpu_temp]).flatten().fold(95.0, f64::max) + 5.0;
             let l = [lines("System", c3, &d.points, |x| x.temp), lines("GPU", c0, &d.points, |x| x.gpu_temp)].concat();
@@ -1022,31 +1234,50 @@ fn about(app: &App, ui: &mut egui::Ui, p: &Pal) {
     ui.hyperlink_to("Project page and documentation", "https://github.com/AnakinSkywalker0/blackbox");
 }
 
-fn nav(ui: &mut egui::Ui, p: &Pal, label: &str, on: bool) -> bool {
-    let text = RichText::new(label).size(14.0).color(if on { p.text } else { p.sub });
-    let b = egui::Button::new(text).fill(if on { p.selected } else { Color32::TRANSPARENT }).stroke(Stroke::NONE).corner_radius(8).min_size(egui::vec2(ui.available_width(), 32.0));
-    let r = ui.add(b);
+/// One sidebar row: a coloured icon tile and a label, highlighted when selected.
+fn nav(ui: &mut egui::Ui, p: &Pal, icon: Icon, color: Color32, label: &str, on: bool) -> bool {
+    let (rect, r) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 36.0), Sense::click());
+    if on || r.hovered() {
+        ui.painter().rect_filled(rect, 9.0, if on { p.selected } else { p.hover });
+    }
+    if r.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    let tile = egui::Rect::from_min_size(egui::pos2(rect.left() + 8.0, rect.center().y - 11.0), egui::vec2(22.0, 22.0));
+    ui.painter().rect_filled(tile, 6.0, Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), if on { 60 } else { 36 }));
+    paint_icon(ui.painter(), tile.shrink(4.0), icon, color);
+    let font = if on { bold(14.0) } else { egui::FontId::proportional(14.0) };
+    ui.painter().text(egui::pos2(tile.right() + 10.0, rect.center().y), egui::Align2::LEFT_CENTER, label, font, if on { p.text } else { p.sub });
     r.clicked()
 }
 
 fn sidebar(app: &App, ui: &mut egui::Ui, p: &Pal, actions: &mut Vec<Action>) {
     ui.add_space(6.0);
     ui.horizontal(|ui| {
-        ui.add_space(8.0);
-        ui.label(RichText::new("blackbox").font(bold(17.0)));
+        ui.add_space(6.0);
+        let (r, _) = ui.allocate_exact_size(egui::vec2(26.0, 26.0), Sense::hover());
+        paint_icon(ui.painter(), r, Icon::Brand, p.text);
+        ui.label(RichText::new("blackbox").font(bold(18.0)));
     });
     ui.add_space(14.0);
     ui.style_mut().spacing.button_padding = egui::vec2(10.0, 6.0);
     ui.spacing_mut().item_spacing.y = 2.0;
-    let mut items = vec![(View::Home, "Home"), (View::Res(Res::Cpu), "CPU"), (View::Res(Res::Memory), "Memory"), (View::Res(Res::Disk), "Disk")];
-    if app.data.as_ref().is_some_and(|d| d.points.iter().any(|x| x.gpu.is_some())) {
-        items.push((View::Res(Res::Gpu), "GPU"));
-    }
-    items.push((View::Res(Res::Heat), "Heat"));
     let current = if app.view == View::Detail { app.back } else { app.view };
-    for (v, label) in items {
-        if nav(ui, p, label, current == v) {
-            actions.push(Action::Go(v));
+    if nav(ui, p, Icon::Home, p.accent, "Home", current == View::Home) {
+        actions.push(Action::Go(View::Home));
+    }
+    let mut items = vec![Res::Cpu, Res::Memory, Res::Disk];
+    let d = app.data.as_ref();
+    if d.is_some_and(|d| d.points.iter().any(|x| x.gpu.is_some())) {
+        items.push(Res::Gpu);
+    }
+    items.push(Res::Heat);
+    if d.is_some_and(|d| d.points.iter().any(|x| x.power.is_some()) || d.latest.as_ref().is_some_and(|s| s.sensors.cpu_power_w.is_some())) {
+        items.push(Res::Power);
+    }
+    for r in items {
+        if nav(ui, p, r.icon(), r.color(p), r.label(), current == View::Res(r)) {
+            actions.push(Action::Go(View::Res(r)));
         }
     }
     ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
@@ -1065,8 +1296,8 @@ fn sidebar(app: &App, ui: &mut egui::Ui, p: &Pal, actions: &mut Vec<Action>) {
             ui.label(RichText::new(text).color(p.sub).size(13.0));
         });
         ui.add_space(10.0);
-        for (v, label) in [(View::About, "About"), (View::Sensors, "Sensors")] {
-            if nav(ui, p, label, current == v) {
+        for (v, icon, label) in [(View::About, Icon::About, "About"), (View::Sensors, Icon::Sensors, "Sensors")] {
+            if nav(ui, p, icon, p.sub, label, current == v) {
                 actions.push(Action::Go(v));
             }
         }
@@ -1127,6 +1358,7 @@ fn parse_view(name: Option<&str>) -> Option<View> {
         "disk" => View::Res(Res::Disk),
         "gpu" => View::Res(Res::Gpu),
         "heat" | "thermal" => View::Res(Res::Heat),
+        "power" => View::Res(Res::Power),
         "sensors" => View::Sensors,
         "about" => View::About,
         _ => return None,
@@ -1234,7 +1466,7 @@ mod tests {
                 settle(&mut h);
                 h.snapshot_options(format!("detail-{suffix}"), &opts);
             }
-            for (v, name) in [(View::Res(Res::Cpu), "cpu"), (View::Res(Res::Heat), "heat"), (View::Sensors, "sensors")] {
+            for (v, name) in [(View::Res(Res::Cpu), "cpu"), (View::Res(Res::Heat), "heat"), (View::Res(Res::Power), "power"), (View::Sensors, "sensors")] {
                 h.state_mut().apply(Action::Go(v));
                 settle(&mut h);
                 h.snapshot_options(format!("{name}-{suffix}"), &opts);

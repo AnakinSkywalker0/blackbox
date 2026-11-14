@@ -46,6 +46,7 @@ LicenseFile=..\LICENSE
 Compression=lzma2
 SolidCompression=yes
 WizardStyle=modern
+SetupIconFile=..\packaging\blackbox.ico
 UninstallDisplayName=blackbox
 UninstallDisplayIcon={app}\bb.exe
 ; A running recorder is stopped explicitly in PrepareToInstall.

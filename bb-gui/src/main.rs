@@ -13,14 +13,16 @@ use bb_core::rules::{analyze, kind_of, Thresholds};
 use bb_core::store::{default_db_path, Store};
 use bb_core::timeparse::parse_duration;
 use chrono::Local;
-use eframe::egui::{self, Color32, Margin, RichText, Sense, Stroke, StrokeKind};
+use eframe::egui::{self, Color32, Margin, RichText, Sense, Stroke};
 use egui_plot::{HoverPosition, Line, Plot, PlotPoints, Polygon};
-use logic::{axis_label, clock, downsample, duration_text, find_bb, find_moments, headline, heat_summary, home_status, recorder_pid, run_bb, split_at_gaps, strip, Health, HeatSummary, Moment, Point, Range, Slot};
+use logic::{axis_label, clock, downsample, duration_text, find_bb, find_moments, headline, heat_summary, home_status, recorder_pid, run_bb, split_at_gaps, Health, HeatSummary, Moment, Point, Range};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::time::{Duration, Instant};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
+/// The logo, for the window and taskbar icon (made by packaging/make_logo.py).
+const LOGO_PNG: &[u8] = include_bytes!("../../packaging/logo-256.png");
 const REFRESH: Duration = Duration::from_secs(5);
 const MOMENT_REFRESH_SECS: i64 = 60;
 
@@ -148,17 +150,6 @@ impl Res {
             Res::Gpu => "GPU",
             Res::Heat => "Heat",
             Res::Power => "Power",
-        }
-    }
-
-    fn icon(self) -> Icon {
-        match self {
-            Res::Cpu => Icon::Cpu,
-            Res::Memory => Icon::Memory,
-            Res::Disk => Icon::Disk,
-            Res::Gpu => Icon::Gpu,
-            Res::Heat => Icon::Heat,
-            Res::Power => Icon::Power,
         }
     }
 
@@ -521,6 +512,15 @@ fn section(ui: &mut egui::Ui, p: &Pal, text: &str) {
     ui.add_space(2.0);
 }
 
+/// The colour for a slowdown's dot and timeline mark.
+fn dot(p: &Pal, c: Confidence) -> Color32 {
+    match c {
+        Confidence::High => p.chart[3],
+        Confidence::Medium => p.chart[2],
+        Confidence::Low => p.muted,
+    }
+}
+
 fn tone(p: &Pal, c: Confidence) -> (Color32, Color32, &'static str) {
     match c {
         Confidence::High => (p.bad_bg, p.bad, "Likely"),
@@ -543,148 +543,6 @@ fn card_frame(p: &Pal) -> egui::Frame {
         .corner_radius(14)
         .inner_margin(Margin::symmetric(16, 14))
         .shadow(egui::Shadow { offset: [0, 2], blur: 10, spread: 0, color: p.shadow })
-}
-
-#[derive(Clone, Copy)]
-enum Icon {
-    Brand,
-    Home,
-    Cpu,
-    Memory,
-    Disk,
-    Gpu,
-    Heat,
-    Power,
-    Sensors,
-    About,
-}
-
-/// Draws a small line icon centred in `r`. Drawn with shapes rather than font symbols, so it
-/// looks the same on every machine whatever fonts are installed.
-fn paint_icon(painter: &egui::Painter, r: egui::Rect, icon: Icon, color: Color32) {
-    use egui::{pos2, Rect, Shape};
-    let c = r.center();
-    let u = r.width() / 16.0; // one unit of a 16-unit grid
-    let st = Stroke::new((1.4 * u).max(1.2), color);
-    let at = |x: f32, y: f32| pos2(c.x + x * u, c.y + y * u);
-    let rect = |x0: f32, y0: f32, x1: f32, y1: f32| Rect::from_two_pos(at(x0, y0), at(x1, y1));
-    match icon {
-        Icon::Brand => {
-            painter.rect_filled(rect(-5.5, -5.5, 5.5, 5.5), 2.0 * u, color);
-            painter.circle_filled(c, 2.0 * u, Color32::WHITE);
-        }
-        Icon::Home => {
-            painter.add(Shape::line(vec![at(-6.0, -0.5), at(0.0, -6.0), at(6.0, -0.5)], st));
-            painter.add(Shape::line(vec![at(-4.5, -1.5), at(-4.5, 5.5), at(4.5, 5.5), at(4.5, -1.5)], st));
-            painter.rect_filled(rect(-1.3, 1.5, 1.3, 5.5), 0.0, color);
-        }
-        Icon::Cpu => {
-            painter.rect_stroke(rect(-4.5, -4.5, 4.5, 4.5), 1.0 * u, st, StrokeKind::Middle);
-            painter.rect_filled(rect(-1.8, -1.8, 1.8, 1.8), 0.5 * u, color);
-            for k in [-2.5_f32, 0.0, 2.5] {
-                for (a, b) in [((k, -4.5), (k, -6.5)), ((k, 4.5), (k, 6.5)), ((-4.5, k), (-6.5, k)), ((4.5, k), (6.5, k))] {
-                    painter.line_segment([at(a.0, a.1), at(b.0, b.1)], st);
-                }
-            }
-        }
-        Icon::Memory => {
-            painter.rect_stroke(rect(-6.5, -3.5, 6.5, 2.5), 1.0 * u, st, StrokeKind::Middle);
-            for x in [-4.0_f32, -1.3, 1.3, 4.0] {
-                painter.rect_filled(rect(x - 0.8, -1.8, x + 0.8, 0.8), 0.0, color);
-            }
-            for x in [-5.0_f32, -2.5, 0.0, 2.5, 5.0] {
-                painter.line_segment([at(x, 2.5), at(x, 4.5)], st);
-            }
-        }
-        Icon::Disk => {
-            painter.circle_stroke(c, 5.8 * u, st);
-            painter.circle_filled(c, 1.6 * u, color);
-        }
-        Icon::Gpu => {
-            painter.rect_stroke(rect(-6.5, -4.0, 6.5, 4.0), 1.0 * u, st, StrokeKind::Middle);
-            painter.circle_stroke(at(-1.5, 0.0), 2.4 * u, st);
-            painter.rect_filled(rect(2.5, -1.8, 4.6, 1.8), 0.0, color);
-            painter.line_segment([at(-4.5, 4.0), at(-4.5, 6.0)], st);
-        }
-        Icon::Heat => {
-            painter.line_segment([at(0.0, -6.0), at(0.0, 2.0)], Stroke::new(3.2 * u, color));
-            painter.circle_filled(at(0.0, 3.5), 2.8 * u, color);
-            for y in [-4.0_f32, -1.5] {
-                painter.line_segment([at(2.5, y), at(4.5, y)], st);
-            }
-        }
-        Icon::Power => {
-            let bolt = [at(1.5, -7.0), at(-4.0, 1.0), at(-0.5, 1.0), at(-1.5, 7.0), at(4.0, -1.0), at(0.5, -1.0)];
-            painter.add(Shape::convex_polygon(vec![bolt[0], bolt[1], bolt[2], bolt[5]], color, Stroke::NONE));
-            painter.add(Shape::convex_polygon(vec![bolt[5], bolt[2], bolt[3], bolt[4]], color, Stroke::NONE));
-        }
-        Icon::Sensors => {
-            painter.circle_filled(c, 1.6 * u, color);
-            painter.circle_stroke(c, 3.8 * u, st);
-            painter.circle_stroke(c, 6.2 * u, Stroke::new(st.width, color.gamma_multiply(0.6)));
-        }
-        Icon::About => {
-            painter.circle_stroke(c, 6.0 * u, st);
-            painter.circle_filled(at(0.0, -3.0), 1.0 * u, color);
-            painter.line_segment([at(0.0, -0.8), at(0.0, 3.8)], Stroke::new(1.8 * u, color));
-        }
-    }
-
-}
-
-/// A rounded tile with an icon in a section's colour, for the sidebar and cards.
-fn icon_tile(ui: &mut egui::Ui, icon: Icon, color: Color32, size: f32) {
-    let (rect, _) = ui.allocate_exact_size(egui::vec2(size, size), Sense::hover());
-    ui.painter().rect_filled(rect, size * 0.28, Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 40));
-    paint_icon(ui.painter(), rect.shrink(size * 0.2), icon, color);
-}
-
-/// Averages `values` into at most `n` points, so a mini chart stays smooth and cheap however
-/// much data there is.
-fn bucket(values: &[f64], n: usize) -> Vec<f64> {
-    if values.len() <= n {
-        return values.to_vec();
-    }
-    let size = values.len().div_ceil(n);
-    values.chunks(size).map(|c| c.iter().sum::<f64>() / c.len() as f64).collect()
-}
-
-/// A small line chart of `values` (oldest first) filling the width given, with a soft fill.
-fn sparkline(ui: &mut egui::Ui, values: &[f64], max: f64, color: Color32, height: f32) {
-    let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), height), Sense::hover());
-    let values = bucket(values, 48);
-    if values.len() < 2 || max <= 0.0 {
-        return;
-    }
-    let pts: Vec<egui::Pos2> = values
-        .iter()
-        .enumerate()
-        .map(|(i, v)| egui::pos2(rect.left() + rect.width() * i as f32 / (values.len() - 1) as f32, rect.bottom() - rect.height() * (v / max).clamp(0.0, 1.0) as f32))
-        .collect();
-    let fill = Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 28);
-    // Filled as thin strips, since egui only fills convex shapes.
-    for w in pts.windows(2) {
-        let quad = vec![w[0], w[1], egui::pos2(w[1].x, rect.bottom()), egui::pos2(w[0].x, rect.bottom())];
-        ui.painter().add(egui::Shape::convex_polygon(quad, fill, Stroke::NONE));
-    }
-    ui.painter().add(egui::Shape::line(pts, Stroke::new(1.8, color)));
-}
-
-/// A card the whole of which can be clicked. Returns true when it was.
-fn click_card(ui: &mut egui::Ui, p: &Pal, id: usize, add: impl FnOnce(&mut egui::Ui)) -> bool {
-    let rect = card_frame(p)
-        .show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            add(ui);
-        })
-        .response
-        .rect;
-    let r = ui.interact(rect, egui::Id::new(("card", id)), Sense::click());
-    if r.hovered() {
-        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-        ui.painter().rect_stroke(rect, 12.0, Stroke::new(1.0, p.border_strong), StrokeKind::Inside);
-    }
-    r.clicked()
 }
 
 fn range_picker(ui: &mut egui::Ui, p: &Pal, current: Range, actions: &mut Vec<Action>) {
@@ -798,148 +656,100 @@ fn home(app: &App, ui: &mut egui::Ui, p: &Pal, actions: &mut Vec<Action>) {
     }
     let Some(d) = &app.data else { return };
     let (health, title, line) = home_status(d.now, app.recorder.is_some(), d.latest.as_ref().map(|s| s.ts), &d.moments);
-    let color = match health {
-        Health::Good => p.ok,
-        Health::Slow => p.warn,
-        Health::Unknown => p.muted,
-    };
-    ui.horizontal(|ui| {
-        ui.add_space(2.0);
-        status_dot(ui, color, 12.0);
-        ui.add_space(4.0);
-        ui.label(RichText::new(title).font(bold(22.0)));
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if d.latest.is_some() && ui.button("Explain the last 10 minutes").clicked() {
-                actions.push(Action::Explain { from: d.now - 600, to: d.now });
+    ui.add_space(6.0);
+    let title_color = if health == Health::Slow { p.warn } else { p.text };
+    ui.label(RichText::new(title).font(bold(32.0)).color(title_color));
+    ui.label(RichText::new(line).color(p.sub).size(15.0));
+
+    // Four plain numbers: no boxes, just a label and a value.
+    if let Some(s) = &d.latest {
+        ui.add_space(30.0);
+        let gb = |b: u64| b as f64 / 1_073_741_824.0;
+        let mut stats: Vec<(Res, String)> = vec![(Res::Cpu, format!("{:.0}%", s.cpu_pct)), (Res::Memory, format!("{:.1} GB", gb(s.mem_used)))];
+        if let Some(t) = s.sensors.temp_c {
+            stats.push((Res::Heat, format!("{t:.0} °C")));
+        }
+        if let Some(w) = s.sensors.cpu_power_w {
+            stats.push((Res::Power, format!("{w:.0} W")));
+        }
+        ui.columns(4, |cols| {
+            for (col, (res, value)) in cols.iter_mut().zip(stats) {
+                let r = col
+                    .scope(|ui| {
+                        ui.label(RichText::new(res.label()).color(p.sub).size(14.0));
+                        ui.label(RichText::new(value).font(bold(30.0)));
+                    })
+                    .response;
+                let r = col.interact(r.rect, egui::Id::new(("stat", res as usize)), Sense::click());
+                if r.hovered() {
+                    col.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                }
+                if r.clicked() {
+                    actions.push(Action::Go(View::Res(res)));
+                }
             }
         });
-    });
-    ui.horizontal(|ui| {
-        ui.add_space(26.0);
-        sub(ui, p, line);
-    });
-
-    ui.add_space(14.0);
-    metric_cards(ui, p, d, actions);
-
-    section(ui, p, "Last 24 hours");
-    let slots = strip(d.now, Range::H24.secs(), 48, &d.points, &d.moments);
-    let (rect, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 30.0), Sense::click());
-    let w = rect.width() / slots.len() as f32;
-    let hovered = resp.hover_pos().map(|pos| (((pos.x - rect.left()) / w) as usize).min(slots.len() - 1));
-    for (i, s) in slots.iter().enumerate() {
-        let r = egui::Rect::from_min_size(egui::pos2(rect.left() + i as f32 * w, rect.top()), egui::vec2((w - 2.0).max(1.0), rect.height()));
-        let (fill, stroke) = match s {
-            Slot::NoData => (p.side, Stroke::NONE),
-            Slot::Fine => (p.ok_bg, Stroke::NONE),
-            Slot::Slow(_, c) => {
-                let (bg, fg, _) = tone(p, *c);
-                (bg, Stroke::new(1.0, fg))
-            }
-        };
-        let fill = if hovered == Some(i) { fill.gamma_multiply(0.75) } else { fill };
-        ui.painter().rect(r, 3.0, fill, stroke, StrokeKind::Inside);
     }
-    if let Some(i) = hovered {
-        let block = Range::H24.secs() / slots.len() as i64;
-        let from = d.now - Range::H24.secs() + i as i64 * block;
-        let what = match slots[i] {
-            Slot::NoData => "Not recording".to_string(),
-            Slot::Fine => "No slowdowns".to_string(),
-            Slot::Slow(k, _) => format!("{}. Click to see why.", headline(d.moments[k].kind)),
-        };
-        if matches!(slots[i], Slot::Slow(..)) {
-            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+
+    // Today as one thin bar, with each slowdown marked on it.
+    ui.add_space(34.0);
+    ui.label(RichText::new("Today").color(p.sub).size(14.0));
+    ui.add_space(6.0);
+    let midnight = Local::now().date_naive().and_hms_opt(0, 0, 0).and_then(|t| t.and_local_timezone(Local).single()).map_or(d.now - 86_400, |t| t.timestamp());
+    let span = (d.now - midnight).max(60) as f32;
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 18.0), Sense::click());
+    let bar = egui::Rect::from_center_size(rect.center(), egui::vec2(rect.width(), 7.0));
+    ui.painter().rect_filled(bar, 3.5, p.side);
+    let x_of = |ts: i64| bar.left() + bar.width() * ((ts - midnight) as f32 / span).clamp(0.0, 1.0);
+    let mut hit: Option<&Moment> = None;
+    for m in d.moments.iter().filter(|m| m.to >= midnight) {
+        let (x0, x1) = (x_of(m.from), x_of(m.to));
+        let seg = egui::Rect::from_min_max(egui::pos2(x0, bar.top()), egui::pos2((x1).max(x0 + 8.0), bar.bottom()));
+        let fg = dot(p, m.confidence);
+        ui.painter().rect_filled(seg, 3.5, fg);
+        if resp.hover_pos().is_some_and(|pos| pos.x >= seg.left() - 4.0 && pos.x <= seg.right() + 4.0) {
+            hit = Some(m);
         }
-        resp.clone().on_hover_text(format!("{} to {}\n{what}", axis_label(from), axis_label(from + block)));
+    }
+    if let Some(m) = hit {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        resp.clone().on_hover_text(format!("{} at {}", headline(m.kind), axis_label(m.from)));
         if resp.clicked() {
-            if let Slot::Slow(k, _) = slots[i] {
-                actions.push(Action::Explain { from: d.moments[k].from, to: d.moments[k].to });
-            }
+            actions.push(Action::Explain { from: m.from, to: m.to });
         }
     }
     ui.horizontal(|ui| {
-        let small = |t: String| RichText::new(t).color(p.muted).size(11.0);
-        ui.label(small(axis_label(d.now - Range::H24.secs())));
+        let small = |t: &str| RichText::new(t.to_string()).color(p.muted).size(12.0);
+        ui.label(small("00:00"));
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            ui.label(small("Now".into()));
+            ui.label(small("Now"));
         });
-    });
-    ui.horizontal(|ui| {
-        for (fill, label) in [(p.ok_bg, "No slowdowns"), (p.warn_bg, "Slowdown"), (p.side, "Not recording")] {
-            let (r, _) = ui.allocate_exact_size(egui::vec2(10.0, 10.0), Sense::hover());
-            ui.painter().rect_filled(r, 2.0, fill);
-            ui.label(RichText::new(label).color(p.muted).size(11.0));
-            ui.add_space(8.0);
-        }
     });
 
-    section(ui, p, "Slowdowns");
+    // Slowdowns as plain rows.
+    ui.add_space(22.0);
     if d.moments.is_empty() {
-        card_frame(p).show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            ui.label(RichText::new("Nothing slowed this computer down in the last 24 hours").font(bold(15.0)));
-            sub(ui, p, if d.points.is_empty() { "There's no recording for this period yet." } else { "When something does, it shows up here with the reason." });
-        });
+        ui.label(RichText::new("Nothing slowed this computer down in the last 24 hours.").color(p.sub).size(15.0));
         return;
     }
     for (i, m) in d.moments.iter().enumerate().rev().take(50) {
-        let clicked = click_card(ui, p, i, |ui| {
-            ui.horizontal(|ui| {
-                ui.vertical(|ui| {
-                    ui.label(RichText::new(headline(m.kind)).font(bold(15.0)));
-                    sub(ui, p, format!("{} to {} · {} · {}", axis_label(m.from), axis_label(m.to), duration_text(m.to - m.from), m.title));
-                });
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.label(RichText::new("›").size(20.0).color(p.muted));
-                    let (bg, fg, label) = tone(p, m.confidence);
-                    chip(ui, bg, fg, label);
-                });
-            });
-        });
-        if clicked {
+        let (rect, r) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 52.0), Sense::click());
+        if r.hovered() {
+            ui.painter().rect_filled(rect.expand2(egui::vec2(10.0, 0.0)), 8.0, p.hover);
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
+        let fg = dot(p, m.confidence);
+        let y = rect.center().y;
+        ui.painter().circle_filled(egui::pos2(rect.left() + 5.0, y), 4.5, fg);
+        ui.painter().text(egui::pos2(rect.left() + 26.0, y), egui::Align2::LEFT_CENTER, headline(m.kind), egui::FontId::proportional(17.0), p.text);
+        ui.painter().text(egui::pos2(rect.right() - 26.0, y), egui::Align2::RIGHT_CENTER, format!("{} · {}", axis_label(m.from), duration_text(m.to - m.from)), egui::FontId::proportional(15.0), p.sub);
+        ui.painter().text(egui::pos2(rect.right() - 4.0, y), egui::Align2::RIGHT_CENTER, "›", egui::FontId::proportional(17.0), p.muted);
+        ui.painter().hline(rect.x_range(), rect.bottom(), Stroke::new(1.0, p.border));
+        let _ = i;
+        if r.clicked() {
             actions.push(Action::Explain { from: m.from, to: m.to });
         }
-        ui.add_space(2.0);
     }
-}
-
-/// One card per resource: its live value and the last hour as a small chart. Clicking a card
-/// opens that resource's full chart.
-fn metric_cards(ui: &mut egui::Ui, p: &Pal, d: &Loaded, actions: &mut Vec<Action>) {
-    let Some(s) = &d.latest else { return };
-    let hour: Vec<&Point> = d.points.iter().filter(|x| x.ts >= (d.now - 3600) as f64).collect();
-    let series = |f: &dyn Fn(&Point) -> Option<f64>| hour.iter().filter_map(|x| f(x)).collect::<Vec<f64>>();
-    let gb = |b: u64| b as f64 / 1_073_741_824.0;
-    let mut cards: Vec<(Res, String, Vec<f64>, f64)> = vec![
-        (Res::Cpu, format!("{:.0}%", s.cpu_pct), series(&|x| Some(x.cpu)), 100.0),
-        (Res::Memory, format!("{:.1} GB", gb(s.mem_used)), series(&|x| Some(x.mem)), 100.0),
-    ];
-    if let Some(t) = s.sensors.temp_c {
-        cards.push((Res::Heat, format!("{t:.0} C"), series(&|x| x.temp), 100.0));
-    }
-    if let Some(w) = s.sensors.cpu_power_w {
-        let pw = series(&|x| x.power);
-        let max = pw.iter().copied().fold(w as f64, f64::max).max(10.0) * 1.15;
-        cards.push((Res::Power, format!("{w:.0} W"), pw, max));
-    }
-    ui.columns(cards.len(), |cols| {
-        for (col, (res, value, values, max)) in cols.iter_mut().zip(cards) {
-            let clicked = click_card(col, p, 1000 + res as usize, |ui| {
-                ui.horizontal(|ui| {
-                    icon_tile(ui, res.icon(), res.color(p), 22.0);
-                    ui.label(RichText::new(res.label()).color(p.sub).size(13.0));
-                });
-                ui.add_space(4.0);
-                ui.label(RichText::new(value).font(bold(24.0)));
-                ui.add_space(2.0);
-                sparkline(ui, &values, max, res.color(p), 34.0);
-            });
-            if clicked {
-                actions.push(Action::Go(View::Res(res)));
-            }
-        }
-    });
 }
 
 fn detail(app: &App, ui: &mut egui::Ui, p: &Pal, actions: &mut Vec<Action>) {
@@ -1234,70 +1044,76 @@ fn about(app: &App, ui: &mut egui::Ui, p: &Pal) {
     ui.hyperlink_to("Project page and documentation", "https://github.com/AnakinSkywalker0/blackbox");
 }
 
-/// One sidebar row: a coloured icon tile and a label, highlighted when selected.
-fn nav(ui: &mut egui::Ui, p: &Pal, icon: Icon, color: Color32, label: &str, on: bool) -> bool {
-    let (rect, r) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 36.0), Sense::click());
+/// The logo (an orange rounded square with a heartbeat line), drawn to fill `r`. Same shape as
+/// docs/img/logo.svg, on its 64-unit grid.
+fn paint_logo(painter: &egui::Painter, r: egui::Rect) {
+    let k = r.width() / 64.0;
+    let at = |x: f32, y: f32| egui::pos2(r.left() + x * k, r.top() + y * k);
+    painter.rect_filled(egui::Rect::from_min_max(at(2.0, 2.0), at(62.0, 62.0)), 15.0 * k, Color32::from_rgb(255, 107, 26));
+    let line = [(11.0, 35.0), (22.0, 35.0), (27.0, 22.0), (34.0, 46.0), (39.0, 29.0), (43.0, 35.0), (53.0, 35.0)];
+    painter.add(egui::Shape::line(line.iter().map(|&(x, y)| at(x, y)).collect(), Stroke::new(5.0 * k, Color32::from_rgb(22, 22, 22))));
+}
+
+/// One sidebar row: plain text, with a soft highlight when selected.
+fn nav(ui: &mut egui::Ui, p: &Pal, label: &str, on: bool) -> bool {
+    let (rect, r) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 40.0), Sense::click());
     if on || r.hovered() {
-        ui.painter().rect_filled(rect, 9.0, if on { p.selected } else { p.hover });
+        ui.painter().rect_filled(rect, 10.0, if on { p.selected } else { p.hover });
     }
     if r.hovered() {
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
     }
-    let tile = egui::Rect::from_min_size(egui::pos2(rect.left() + 8.0, rect.center().y - 11.0), egui::vec2(22.0, 22.0));
-    ui.painter().rect_filled(tile, 6.0, Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), if on { 60 } else { 36 }));
-    paint_icon(ui.painter(), tile.shrink(4.0), icon, color);
-    let font = if on { bold(14.0) } else { egui::FontId::proportional(14.0) };
-    ui.painter().text(egui::pos2(tile.right() + 10.0, rect.center().y), egui::Align2::LEFT_CENTER, label, font, if on { p.text } else { p.sub });
+    ui.painter().text(egui::pos2(rect.left() + 14.0, rect.center().y), egui::Align2::LEFT_CENTER, label, egui::FontId::proportional(16.0), if on { p.text } else { p.sub });
     r.clicked()
 }
 
 fn sidebar(app: &App, ui: &mut egui::Ui, p: &Pal, actions: &mut Vec<Action>) {
-    ui.add_space(6.0);
-    ui.horizontal(|ui| {
-        ui.add_space(6.0);
-        let (r, _) = ui.allocate_exact_size(egui::vec2(26.0, 26.0), Sense::hover());
-        paint_icon(ui.painter(), r, Icon::Brand, p.text);
-        ui.label(RichText::new("blackbox").font(bold(18.0)));
-    });
     ui.add_space(14.0);
-    ui.style_mut().spacing.button_padding = egui::vec2(10.0, 6.0);
-    ui.spacing_mut().item_spacing.y = 2.0;
+    ui.horizontal(|ui| {
+        ui.add_space(12.0);
+        let (r, _) = ui.allocate_exact_size(egui::vec2(26.0, 26.0), Sense::hover());
+        paint_logo(ui.painter(), r);
+        ui.add_space(2.0);
+        ui.label(RichText::new("blackbox").font(bold(19.0)));
+    });
+    ui.add_space(24.0);
+    ui.spacing_mut().item_spacing.y = 4.0;
     let current = if app.view == View::Detail { app.back } else { app.view };
-    if nav(ui, p, Icon::Home, p.accent, "Home", current == View::Home) {
+    if nav(ui, p, "Overview", current == View::Home) {
         actions.push(Action::Go(View::Home));
     }
-    let mut items = vec![Res::Cpu, Res::Memory, Res::Disk];
     let d = app.data.as_ref();
-    if d.is_some_and(|d| d.points.iter().any(|x| x.gpu.is_some())) {
-        items.push(Res::Gpu);
-    }
-    items.push(Res::Heat);
+    let mut items = vec![Res::Cpu, Res::Memory, Res::Heat];
     if d.is_some_and(|d| d.points.iter().any(|x| x.power.is_some()) || d.latest.as_ref().is_some_and(|s| s.sensors.cpu_power_w.is_some())) {
         items.push(Res::Power);
     }
+    items.push(Res::Disk);
+    if d.is_some_and(|d| d.points.iter().any(|x| x.gpu.is_some())) {
+        items.push(Res::Gpu);
+    }
     for r in items {
-        if nav(ui, p, r.icon(), r.color(p), r.label(), current == View::Res(r)) {
+        if nav(ui, p, r.label(), current == View::Res(r)) {
             actions.push(Action::Go(View::Res(r)));
         }
     }
     ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
-        ui.add_space(6.0);
-        let have_bb = app.bb.is_some();
-        let (label, verb) = if app.recorder.is_some() { ("Stop recording", "stop") } else { ("Start recording", "start") };
-        let b = egui::Button::new(RichText::new(label).size(13.0)).min_size(egui::vec2(ui.available_width(), 28.0));
-        if ui.add_enabled(have_bb, b).on_disabled_hover_text("The bb program wasn't found next to this window or on PATH").clicked() {
+        ui.add_space(8.0);
+        let (label, verb) = if app.recorder.is_some() { ("Recording", "stop") } else { ("Not recording", "start") };
+        let hint = if app.recorder.is_some() { "Click to stop recording" } else { "Click to start recording" };
+        let (rect, r) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 32.0), Sense::click());
+        if r.hovered() {
+            ui.painter().rect_filled(rect, 8.0, p.hover);
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
+        let dot = if app.recorder.is_some() { p.ok } else { p.muted };
+        ui.painter().circle_filled(egui::pos2(rect.left() + 18.0, rect.center().y), 4.0, dot);
+        ui.painter().text(egui::pos2(rect.left() + 30.0, rect.center().y), egui::Align2::LEFT_CENTER, label, egui::FontId::proportional(13.0), p.sub);
+        if r.on_hover_text(hint).clicked() && app.bb.is_some() {
             actions.push(Action::Recorder(verb));
         }
-        ui.add_space(4.0);
-        ui.horizontal(|ui| {
-            ui.add_space(8.0);
-            let (color, text) = if app.recorder.is_some() { (p.ok, "Recording") } else { (p.muted, "Not recording") };
-            status_dot(ui, color, 8.0);
-            ui.label(RichText::new(text).color(p.sub).size(13.0));
-        });
-        ui.add_space(10.0);
-        for (v, icon, label) in [(View::About, Icon::About, "About"), (View::Sensors, Icon::Sensors, "Sensors")] {
-            if nav(ui, p, icon, p.sub, label, current == v) {
+        ui.add_space(6.0);
+        for (v, label) in [(View::About, "About"), (View::Sensors, "Sensors")] {
+            if nav(ui, p, label, current == v) {
                 actions.push(Action::Go(v));
             }
         }
@@ -1312,13 +1128,13 @@ impl eframe::App for App {
         let mut actions: Vec<Action> = Vec::new();
 
         egui::Panel::left("nav")
-            .exact_size(176.0)
+            .exact_size(200.0)
             .resizable(false)
             .show_separator_line(false)
-            .frame(egui::Frame::new().fill(p.side).stroke(Stroke::new(1.0, p.border)).inner_margin(Margin::same(10)))
+            .frame(egui::Frame::new().fill(p.bg).inner_margin(Margin::same(12)))
             .show(ui, |ui| sidebar(self, ui, &p, &mut actions));
 
-        egui::CentralPanel::default().frame(egui::Frame::new().fill(p.bg).inner_margin(Margin::symmetric(28, 22))).show(ui, |ui| {
+        egui::CentralPanel::default().frame(egui::Frame::new().fill(p.bg).stroke(Stroke::new(1.0, p.border)).inner_margin(Margin::symmetric(44, 30))).show(ui, |ui| {
             if let Some((msg, _)) = &self.notice {
                 egui::Frame::new().fill(p.side).corner_radius(8).inner_margin(Margin::symmetric(12, 6)).show(ui, |ui| {
                     ui.set_width(ui.available_width());
@@ -1383,7 +1199,11 @@ fn main() -> eframe::Result {
     let (db, start) = parse_args(std::env::args().skip(1));
     let db = db.unwrap_or_else(default_db_path);
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default().with_title("blackbox").with_inner_size([1040.0, 760.0]).with_min_inner_size([760.0, 520.0]),
+        viewport: egui::ViewportBuilder::default()
+            .with_title("blackbox")
+            .with_icon(std::sync::Arc::new(eframe::icon_data::from_png_bytes(LOGO_PNG).unwrap_or_default()))
+            .with_inner_size([1040.0, 760.0])
+            .with_min_inner_size([760.0, 520.0]),
         ..Default::default()
     };
     eframe::run_native("blackbox", options, Box::new(move |cc| Ok(Box::new(App::new(cc, db, start)))))

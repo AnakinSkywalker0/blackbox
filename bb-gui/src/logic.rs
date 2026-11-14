@@ -327,8 +327,8 @@ pub fn home_status(now: i64, recording: bool, last_sample: Option<i64>, moments:
     let n = moments.len();
     let summary = match n {
         0 => "No slowdowns in the last 24 hours".to_string(),
-        1 => "1 slowdown in the last 24 hours, explained below".to_string(),
-        _ => format!("{n} slowdowns in the last 24 hours, explained below"),
+        1 => "1 slowdown in the last 24 hours · explained".to_string(),
+        _ => format!("{n} slowdowns in the last 24 hours · all explained"),
     };
     if !recording || !fresh {
         let since = match last_sample {
@@ -340,48 +340,8 @@ pub fn home_status(now: i64, recording: bool, last_sample: Option<i64>, moments:
     }
     match moments.iter().rev().find(|m| now - m.to <= 300) {
         Some(m) => (Health::Slow, format!("Slow right now: {}", headline(m.kind).to_lowercase()), summary),
-        None => (Health::Good, "Running smoothly right now".into(), summary),
+        None => (Health::Good, "Running smoothly".into(), summary),
     }
-}
-
-/// One block of the 24-hour strip on Home.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub enum Slot {
-    NoData,
-    Fine,
-    /// Index into the moments list, of the most confident moment in this block.
-    Slow(usize, Confidence),
-}
-
-/// Splits `[now - span, now]` into `n` blocks and marks each as unrecorded, fine, or slow.
-pub fn strip(now: i64, span: i64, n: usize, points: &[Point], moments: &[Moment]) -> Vec<Slot> {
-    let n = n.max(1);
-    let w = span as f64 / n as f64;
-    let start = (now - span) as f64;
-    let mut out = vec![Slot::NoData; n];
-    for p in points {
-        let i = ((p.ts - start) / w).floor();
-        if i >= 0.0 && (i as usize) < n {
-            out[i as usize] = Slot::Fine;
-        }
-    }
-    for (k, m) in moments.iter().enumerate() {
-        let a = ((m.from as f64 - start) / w).floor().max(0.0) as usize;
-        let b = ((m.to as f64 - start) / w).floor();
-        if b < 0.0 {
-            continue;
-        }
-        for slot in out.iter_mut().take((b as usize).min(n - 1) + 1).skip(a) {
-            let stronger = match *slot {
-                Slot::Slow(_, c) => m.confidence > c,
-                _ => true,
-            };
-            if stronger {
-                *slot = Slot::Slow(k, m.confidence);
-            }
-        }
-    }
-    out
 }
 
 // ---- the recorder and the bb program ---------------------------------------------------
@@ -647,23 +607,6 @@ mod tests {
         assert_eq!(home_status(now, false, Some(now - 1), &[]).0, Health::Unknown);
         assert_eq!(home_status(now, true, Some(now - 3600), &[]).0, Health::Unknown);
         assert!(home_status(now, true, None, &[]).2.contains("Nothing recorded"));
-    }
-
-    #[test]
-    fn strip_marks_gaps_fine_time_and_slowdowns() {
-        let now = 24 * 3600;
-        // Recording only in the second half of the day.
-        let pts: Vec<Point> = (12 * 60..24 * 60).map(|m| pt((m * 60) as f64)).collect();
-        let ms = vec![moment(20 * 3600, 20 * 3600 + 600, "memory", Confidence::Medium), moment(20 * 3600 + 100, 20 * 3600 + 200, "cpu_hog", Confidence::High)];
-        let s = strip(now, 24 * 3600, 24, &pts, &ms);
-        assert_eq!(s.len(), 24);
-        assert_eq!(s[3], Slot::NoData);
-        assert_eq!(s[13], Slot::Fine);
-        assert_eq!(s[20], Slot::Slow(1, Confidence::High), "the more confident moment wins");
-        // A moment that started before the strip still shows, and nothing panics at the edges.
-        let early = vec![moment(-500, 30, "memory", Confidence::Low)];
-        assert_eq!(strip(now, 24 * 3600, 24, &[], &early)[0], Slot::Slow(0, Confidence::Low));
-        assert_eq!(strip(now, 24 * 3600, 0, &[], &[]).len(), 1);
     }
 
     #[test]

@@ -1,3 +1,5 @@
+<p align="center"><img src="docs/img/logo.svg" alt="blackbox logo" width="96"></p>
+
 # blackbox (`bb`)
 
 **A flight recorder for your computer's performance. Ask it why your machine was slow, and it tells you.**

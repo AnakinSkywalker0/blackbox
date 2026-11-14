@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64" role="img" aria-label="blackbox logo">
+  <!-- Flight recorders are painted international orange so they can be found; the line is the
+       machine's vitals being recorded. -->
+  <rect x="2" y="2" width="60" height="60" rx="15" fill="#FF6B1A"/>
+  <polyline points="11,35 22,35 27,22 34,46 39,29 43,35 53,35" fill="none" stroke="#161616" stroke-width="5" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>

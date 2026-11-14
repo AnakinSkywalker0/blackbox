@@ -24,7 +24,7 @@ $productCode = '{6F291038-731F-4998-AADF-C25DCFC0032C}_is1'
 $dir = Join-Path $OutDir "manifests/a/AnakinSkywalker0/blackbox/$Version"
 New-Item -ItemType Directory -Force $dir | Out-Null
 
-$schema = '1.10.0'
+$schema = '1.28.0'
 $header = @"
 # yaml-language-server: `$schema=https://aka.ms/winget-manifest.{0}.{1}.schema.json
 "@

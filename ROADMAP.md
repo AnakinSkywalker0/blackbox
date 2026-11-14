@@ -2,7 +2,7 @@
 
 What's planned for blackbox, with the reason for each item and how to tell when it's done. Items are sized to fit in one focused piece of work. Shipped work is listed in the [README](README.md#roadmap) and in the [releases](https://github.com/AnakinSkywalker0/blackbox/releases).
 
-Status: **v0.5.1 released**, with `bb fix`, `bb blame` and the desktop window.
+Status: **v0.5.1 released**, with `bb fix`, `bb blame` and the desktop window. Available on winget since 2026-11-10.
 
 ---
 
@@ -24,6 +24,9 @@ Status: **v0.5.1 released**, with `bb fix`, `bb blame` and the desktop window.
 | **Per-program GPU use** | GPU load is whole-machine only, so a maxed GPU has no culprit. | Windows GPU Engine counters are attributed to programs, and the "GPU maxed" finding names one. |
 | **Disk health** | A failing disk shows up as "slow disk" with no reason. | SMART / NVMe health readings where available without admin, shown in `bb sensors` and cited by the slow-disk rule. |
 | **AMD and Intel GPU temperature** | GPU heat and throttle reasons are NVIDIA-only. | Read through vendor libraries where present, otherwise "not available", same as today. |
+| **Microstutter finder** | Averages hide frame hitches. A hitch usually lines up with a disk stall, a paging burst, a clock dip or a game thread on an efficiency core. | A `bb why` rule that finds short hitches in fast samples (about 100 ms, only while a fullscreen app runs) and names the cause. `bb selftest` induces one and checks it. |
+| **Hybrid-core placement** | On Intel hybrid CPUs, work on E-cores or parked cores causes stutter that no current rule sees. | Per-core clock and use are recorded, and a rule flags a foreground load stuck on efficiency cores. |
+| **Frame-time capture** | Hitches need frame times to be measured, not guessed. | An optional mode reads PresentMon-style ETW present events (licence and admin needs to be checked first) and feeds the stutter rule. |
 
 ## 3. Desktop window (`bb-gui`)
 
@@ -52,7 +55,7 @@ Status: **v0.5.1 released**, with `bb fix`, `bb blame` and the desktop window.
 
 | Item | Why | Done when |
 |---|---|---|
-| **Winget listing** | The PR to `microsoft/winget-pkgs` hasn't passed install validation yet. | `winget install AnakinSkywalker0.blackbox` works. |
+| **Winget: keep it current** | Listed since 2026-11-10 (0.4.2, [#445691](https://github.com/microsoft/winget-pkgs/pull/445691)). Each release still needs its own PR; 0.5.1 is [#480309](https://github.com/microsoft/winget-pkgs/pull/480309). | Each release lands on winget without a manual PR, for example through the winget-releaser action. |
 | **Code signing** | Unsigned installers trigger SmartScreen. Needs a certificate only the owner can obtain (see [docs/SIGNING.md](docs/SIGNING.md)). | Release artifacts are signed in CI. |
 | **Real desktop-login autostart on Linux and macOS** | Created and checked in CI, but never exercised by an actual login. | Verified on a real Ubuntu desktop and a real Mac, and documented. |
 | **Split `rules.rs`** | It's 1,300 lines covering every rule. | One module per cause, same public `analyze` API, no test changes needed. |

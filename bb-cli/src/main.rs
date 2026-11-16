@@ -13,6 +13,7 @@ use bb_core::store::{default_db_path, Store};
 use bb_core::timeparse::{parse_duration, parse_when};
 use chrono::{DateTime, Local, TimeZone};
 use clap::{Parser, Subcommand};
+use std::io::IsTerminal;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -411,6 +412,29 @@ fn why(db: &std::path::Path, when: &str, span: &str) -> Res {
         println!();
     }
     println!("{ASK}");
+    offer_fix(db, &titles)
+}
+
+/// After a diagnosis, point at the `bb fix` kinds that match it. Added after the
+/// diagnosis so the diagnosis text itself is unchanged. Nothing is applied here:
+/// `fix::run` asks before every change.
+fn offer_fix(db: &std::path::Path, titles: &[String]) -> Res {
+    if !fix::supported() {
+        return Ok(());
+    }
+    let only = fix::kinds_for_findings(titles);
+    if only.is_empty() {
+        return Ok(());
+    }
+    let list = only.join(",");
+    println!("
+bb fix can act on this: bb fix --only {list}");
+    println!("It looks at the machine as it is now (not at the time you asked about), asks before each change,");
+    println!("shows before and after, and `bb fix --undo` reverses it.");
+    if std::io::stdin().is_terminal() && fix::ask("Run it now?") {
+        let only: Vec<String> = only.iter().map(|k| k.to_string()).collect();
+        return fix::run(db, false, false, false, &only);
+    }
     Ok(())
 }
 

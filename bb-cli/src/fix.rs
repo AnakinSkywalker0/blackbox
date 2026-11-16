@@ -91,6 +91,28 @@ fn write_log(db: &Path, log: &[Batch]) -> Res {
 
 // ---- pure decisions (tested) ----------------------------------------------------------------------
 
+pub fn supported() -> bool {
+    platform::SUPPORTED
+}
+
+/// Which `bb fix --only` kinds match a `bb why` diagnosis, given the finding titles.
+/// Heat, GPU and disk findings have no fix, so they map to nothing.
+pub fn kinds_for_findings(titles: &[String]) -> Vec<&'static str> {
+    let mut out: Vec<&'static str> = Vec::new();
+    for t in titles {
+        let kind = match bb_core::rules::kind_of(t) {
+            "cpu_hog" | "cpu_saturated" | "cpu_spike" => "priority",
+            "memory" | "memory_squeeze" => "memory",
+            "battery_saver" => "power",
+            _ => continue,
+        };
+        if !out.contains(&kind) {
+            out.push(kind);
+        }
+    }
+    out
+}
+
 pub fn is_protected(name: &str) -> bool {
     let n = name.to_lowercase();
     PROTECTED.contains(&n.as_str())
@@ -214,7 +236,7 @@ struct Proposal {
     optional: bool,
 }
 
-fn ask(question: &str) -> bool {
+pub fn ask(question: &str) -> bool {
     print!("{question} [y/N] ");
     let _ = std::io::stdout().flush();
     let mut line = String::new();
@@ -521,6 +543,20 @@ mod platform {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn diagnoses_map_to_matching_fixes_and_never_to_the_rest() {
+        let t = |x: &str| x.to_string();
+        let got = kinds_for_findings(&[
+            t("chrome.exe was using a large share of the CPU"),
+            t("CPU was saturated by many programs at once"),
+            t("Memory pressure, the machine was short on RAM"),
+            t("Battery Saver was limiting performance"),
+        ]);
+        assert_eq!(got, vec!["priority", "memory", "power"]);
+        assert!(kinds_for_findings(&[t("The machine was running very hot"), t("Heavy disk activity")]).is_empty());
+        assert!(kinds_for_findings(&[]).is_empty());
+    }
+
     use super::*;
 
     fn top(v: &[(&str, f32)]) -> Vec<(String, f32)> {

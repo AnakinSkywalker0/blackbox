@@ -20,7 +20,7 @@ The capture above is real and unstaged. It was taken during a release build of b
 
 - **It tests itself.** `bb selftest` causes real slowdowns on your machine (CPU hog, a short burst, heavy disk, memory pressure) plus a quiet control run, then reports "detected N of M" and any false alarms.
 - **It explains 14 kinds of slowdown**, including short CPU spikes and disk stalls that averages hide, CPU throttling with the cause (heat, Battery Saver, battery limits), GPU throttling, and machine stalls.
-- **Private by design.** Everything stays in a local SQLite file. The only network use is `bb update`, which runs only when you type it.
+- **Private by design, and free.** All data stays on your machine in a local SQLite file; nothing is ever uploaded. The only network use is `bb update`, which runs only when you type it. Licensed under the [MIT license](LICENSE).
 - **Small and cheap.** About 2% of one core and 40 MB of RAM on Windows. Old data is thinned automatically, so a week of history is about 140 MB.
 - **Easy to install and update.** One-line installers, a Windows installer, Scoop, and `bb update` with checksum verification. About 135 automated tests run on Windows, Linux and macOS in CI.
 
@@ -72,7 +72,7 @@ scoop update bb
 
 Scoop puts `bb` on your PATH but does not register start at login; run `bb start`, or `bb install` for login startup.
 
-**Winget** (once the package is accepted into the winget catalog, see [packaging/winget](packaging/winget/README.md)):
+**Winget** (live since 2026-11-10; version 0.5.1 since 2026-11-14):
 
 ```
 winget install AnakinSkywalker0.blackbox
@@ -519,7 +519,7 @@ cargo test --release -p bb-core size_of -- --ignored --nocapture
 | **v0.2** | Battery and power, temperature, GPU, disk latency, short-spike and stall detection, one-command `install`, background `start`/`stop`, `bb sensors` |
 | **v0.4** | `bb selftest` (causes real slowdowns, reports "detected N of M" and false alarms), measured paging for memory pressure, `bb feedback`, Linux and macOS install/update, macOS and Linux CI, one-line install scripts, fixed latest-download links |
 | **v0.5** (now) | `bb blame`, `bb fix`, the desktop window redesigned as a status page |
-| **Next** | See [ROADMAP.md](ROADMAP.md): retention that can't wipe history, Windows Event Log correlation, network and per-program GPU, an HTML report, tray notifications, winget and code signing |
+| **Next** | See [ROADMAP.md](ROADMAP.md): Windows Event Log correlation, network and per-program GPU, an HTML report, tray notifications, winget and code signing |
 
 ---
 

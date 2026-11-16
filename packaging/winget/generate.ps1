@@ -49,7 +49,7 @@ InstallModes:
 - interactive
 - silent
 - silentWithProgress
-UpgradeBehavior: install
+UpgradeBehavior: uninstallPrevious
 ReleaseDate: $ReleaseDate
 Installers:
 - Architecture: x64

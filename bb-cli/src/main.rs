@@ -2,6 +2,7 @@ mod blame;
 mod failures;
 mod fix;
 mod heat;
+mod hook;
 mod install;
 mod selftest;
 mod update;
@@ -153,6 +154,11 @@ enum Cmd {
         #[arg(short = 'n', long, default_value_t = 10)]
         limit: u32,
     },
+    /// Notice failed commands in your shell and offer `bb why` (edits your shell profile, with a backup)
+    Hook {
+        #[command(subcommand)]
+        cmd: HookCmd,
+    },
     /// Show what has been recorded
     Status,
     /// Show which sensors (battery, temperature, GPU, disk latency) work on this machine
@@ -179,6 +185,38 @@ enum Cmd {
         /// How long to measure, in seconds
         #[arg(long, default_value_t = 15)]
         secs: u64,
+    },
+}
+
+#[derive(Subcommand)]
+enum HookCmd {
+    /// Add the hook to your shell profile (backs it up first; safe to run twice)
+    Install {
+        /// powershell, bash or zsh
+        shell: String,
+        /// Edit this file instead of the shell's usual profile
+        #[arg(long)]
+        profile: Option<PathBuf>,
+    },
+    /// Remove the hook, leaving the rest of your profile as it was
+    Uninstall {
+        /// powershell, bash or zsh
+        shell: String,
+        /// Edit this file instead of the shell's usual profile
+        #[arg(long)]
+        profile: Option<PathBuf>,
+    },
+    /// Show whether the hook is installed
+    Status,
+    /// Used by the hook itself to remember a failed command. Silent by design.
+    #[command(hide = true)]
+    Record {
+        #[arg(long, allow_hyphen_values = true)]
+        exit: i32,
+        #[arg(long, allow_hyphen_values = true)]
+        cmd: String,
+        #[arg(long)]
+        cwd: Option<String>,
     },
 }
 
@@ -211,6 +249,12 @@ fn main() {
         Cmd::Heat { cmd: Some(HeatCmd::Test { yes }) } => heat::test(&db, yes),
         Cmd::Heat { cmd: None } => heat::history(&db),
         Cmd::Failures { limit } => failures::list(&db, limit),
+        Cmd::Hook { cmd } => match cmd {
+            HookCmd::Install { shell, profile } => hook::install(&shell, profile.as_deref()),
+            HookCmd::Uninstall { shell, profile } => hook::uninstall(&shell, profile.as_deref()),
+            HookCmd::Status => hook::status(),
+            HookCmd::Record { exit, cmd, cwd } => hook::record(&db, exit, &cmd, cwd.as_deref()),
+        },
         Cmd::Status => status(&db),
         Cmd::Sensors => sensors(),
         Cmd::Selftest { only, memory } => selftest::run(&only, memory, install::running_pid(&db).is_some()),

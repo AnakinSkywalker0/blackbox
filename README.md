@@ -300,7 +300,13 @@ blackbox can also remember commands that failed, and explain them next to the ma
 | Command | What it does |
 |---|---|
 | `bb failures [-n 10]` | Lists the most recent failed commands: when, exit code, command |
+| `bb hook install <shell>` | Adds a few lines to your shell profile (`powershell`, `bash` or `zsh`) so that when a command fails, one line offering `bb why` is printed and the failure is recorded. It never runs a diagnosis or a fix for you |
+| `bb hook uninstall <shell>` / `bb hook status` | Remove it, leaving the rest of your profile as it was; or show where it is installed |
 | `bb why [WHEN]` | Unchanged, plus a "Failed commands in this window" section when any were recorded then. For each: what the error text says (when it was captured) and whether the machine was also struggling while it ran |
+
+**The hook is built not to get in the way.** `bb hook install` saves your profile as `<profile>.bb-backup` the first time, puts everything in one block between `# >>> blackbox hook >>>` and `# <<< blackbox hook <<<`, and does nothing if the block is already there. Uninstalling removes exactly that block. A block someone has edited so a marker is missing is left alone with an error, and profiles that aren't UTF-8 are refused rather than rewritten. If `bb` is missing or its database can't be opened, the hook prints nothing and your shell carries on. On a successful command it costs well under a millisecond (measured on Windows PowerShell 5.1: about 0.05 ms per prompt); only a failure starts `bb`. Use `--profile <file>` to point at a different file.
+
+PowerShell won't load any profile under the Restricted or AllSigned execution policy; `bb hook install` warns when that's your policy. The hook only sees exit codes, not output. A PowerShell error that isn't a program's exit code is recorded as exit 1. The zsh hook is written and unit-tested but has not been run in a real zsh yet.
 
 The error diagnosis is pattern matching on the text, and says so: it names a cause only when it can point at the line that shows it, and otherwise says it doesn't recognise the error. Output is stored only for commands run through `bb watch`; a shell hook can record that a command failed but not what it printed. Stored output is cut to its last 64 KB.
 

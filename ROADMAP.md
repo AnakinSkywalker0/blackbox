@@ -67,7 +67,7 @@ Status: **v0.5.1 released**, with `bb fix`, `bb blame` and the desktop window. A
 | Item | Why | Status |
 |---|---|---|
 | **Failure store and text diagnosis** | A slowdown often shows up as a failed build or script, and the error text usually names the cause. | Done: `failures` table (schema 5), `bb failures`, and a failed-commands section in `bb why`. |
-| **Shell hook** | Notice a failed command without being asked. | Planned: `bb hook install/uninstall/status` for PowerShell, bash and zsh. |
+| **Shell hook** | Notice a failed command without being asked. | Done: `bb hook install/uninstall/status` for PowerShell, bash and zsh. Run for real in PowerShell 5.1 and bash; zsh is untested in a real shell. |
 | **`bb explain`** | Diagnose error text pasted from anywhere. | Planned. |
 | **MCP server** | Let an AI agent ask bb about a failed build. | Planned: read-only `bb mcp serve`. |
 | **`bb watch <command>`** | Capture output live and diagnose on failure. | Planned. |

@@ -8,6 +8,7 @@ mod install;
 mod mcp;
 mod selftest;
 mod update;
+mod watch;
 
 use bb_core::model::{describe_sensors as describe, Sample};
 use bb_core::sensors::SensorReader;
@@ -167,6 +168,15 @@ enum Cmd {
         #[arg(long, allow_hyphen_values = true)]
         exit: Option<i32>,
     },
+    /// Run a command, show its output live, and if it fails say why (exits with the command's own code)
+    Watch {
+        /// Don't save a failure to the database
+        #[arg(long)]
+        no_record: bool,
+        /// The command and its arguments, for example: bb watch cargo build
+        #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true, num_args = 1..)]
+        command: Vec<String>,
+    },
     /// Let an AI agent ask blackbox why a command failed (a read-only MCP server)
     Mcp {
         #[command(subcommand)]
@@ -274,6 +284,7 @@ fn main() {
         Cmd::Heat { cmd: None } => heat::history(&db),
         Cmd::Failures { limit } => failures::list(&db, limit),
         Cmd::Explain { file, clipboard, exit } => explain::run(file.as_deref(), clipboard, exit),
+        Cmd::Watch { no_record, command } => watch::run(&db, &command, !no_record),
         Cmd::Mcp { cmd: McpCmd::Serve } => mcp::serve(&db),
         Cmd::Hook { cmd } => match cmd {
             HookCmd::Install { shell, profile } => hook::install(&shell, profile.as_deref()),

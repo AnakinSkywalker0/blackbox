@@ -300,6 +300,7 @@ blackbox can also remember commands that failed, and explain them next to the ma
 | Command | What it does |
 |---|---|
 | `bb failures [-n 10]` | Lists the most recent failed commands: when, exit code, command |
+| `bb watch <command...>` | Runs the command, shows its output as it arrives, and if it fails prints why (to stderr, so the command's stdout stays clean for pipes) and saves the failure with its output. Its exit code is always the command's own (127 if the program doesn't exist, 126 if it can't be run). Ctrl-C stops the command (after a short grace period) and prints no diagnosis. `--no-record` diagnoses without saving. Example: `bb watch cargo build` |
 | `bb explain [FILE]` | Diagnoses error text you didn't capture: from a file, from stdin (`some-command 2>&1 \| bb explain`), or with `--clipboard`. `--exit N` adds the exit code as evidence. It uses the same rules and wording as `bb why`, says "nothing looks like an error" for ordinary text, and refuses empty or binary input instead of guessing. Reads UTF-16 files, which is what PowerShell 5.1 writes for `2> errors.txt` |
 | `bb hook install <shell>` | Adds a few lines to your shell profile (`powershell`, `bash` or `zsh`) so that when a command fails, one line offering `bb why` is printed and the failure is recorded. It never runs a diagnosis or a fix for you |
 | `bb hook uninstall <shell>` / `bb hook status` | Remove it, leaving the rest of your profile as it was; or show where it is installed |
@@ -337,6 +338,8 @@ Other clients: paste this into the client's MCP settings (`bb` must be on PATH, 
 ```
 
 It speaks the current protocol revision (2026-07-28, stateless, with `server/discover`) and the older `initialize` handshake that most clients still use. It has been tested against its own protocol tests and by hand over stdio; it has not yet been run inside a real MCP client. Use `bb --db <file> mcp serve` to point it at a different database.
+
+`bb watch` reads the command's output through pipes so it can keep it, which means programs that only colour or animate their output on a real terminal print it plainly. It runs programs, not shell built-ins: for those, use `bb watch cmd /c ...` or `bb watch powershell -Command ...`. On Windows it finds `npm`, `yarn` and other `.cmd` programs the way the shell does. Real Ctrl-C handling is tested on Linux and macOS in CI-style tests and, on Windows, by simulating the interrupt; it has not been tried by hand with a real Ctrl-C yet.
 
 The error diagnosis is pattern matching on the text, and says so: it names a cause only when it can point at the line that shows it, and otherwise says it doesn't recognise the error. Output is stored only for commands run through `bb watch`; a shell hook can record that a command failed but not what it printed. Stored output is cut to its last 64 KB.
 

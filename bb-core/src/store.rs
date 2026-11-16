@@ -631,6 +631,99 @@ mod tests {
         let mut s = Store::open_in_memory().unwrap();
         assert_eq!(s.maintain(1_000_000_000, 7).unwrap(), 0);
     }
+
+    fn temp_path(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("bb-store-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[test]
+    fn a_file_that_is_not_a_database_is_an_error_and_is_left_alone() {
+        let dir = temp_path("garbage");
+        let path = dir.join("bb.db");
+        let junk = b"this is not a sqlite database, just text that is long enough to look like one".repeat(20);
+        std::fs::write(&path, &junk).unwrap();
+        assert!(Store::open(&path).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), junk, "a failed open must not overwrite the file");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_directory_in_place_of_the_database_is_an_error() {
+        let dir = temp_path("isdir");
+        assert!(Store::open(&dir).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_failing_batch_inserts_nothing() {
+        let mut s = Store::open_in_memory().unwrap();
+        s.conn
+            .execute_batch(
+                "CREATE TRIGGER refuse BEFORE INSERT ON samples WHEN NEW.ts = 502
+                 BEGIN SELECT RAISE(ABORT, 'refused'); END;",
+            )
+            .unwrap();
+        let batch = [sample(500), sample(501), sample(502), sample(503)];
+        assert!(s.insert_many(&batch).is_err());
+        assert_eq!(s.stats().unwrap().samples, 0, "the transaction must roll back as a whole");
+        // The store is still usable afterwards.
+        s.insert(&sample(600)).unwrap();
+        assert_eq!(s.stats().unwrap().samples, 1);
+    }
+
+    #[test]
+    fn a_failing_maintain_keeps_every_sample() {
+        let mut s = Store::open_in_memory().unwrap();
+        let last = 1_000_000_000;
+        for t in 0..20 {
+            s.insert(&sample(last - 9 * 86400 + t)).unwrap();
+        }
+        s.insert(&sample(last)).unwrap();
+        s.conn
+            .execute_batch(
+                "CREATE TRIGGER no_delete BEFORE DELETE ON samples
+                 BEGIN SELECT RAISE(ABORT, 'refused'); END;",
+            )
+            .unwrap();
+        assert!(s.maintain(last, 7).is_err());
+        assert_eq!(s.stats().unwrap().samples, 21, "a half-finished prune must be rolled back");
+    }
+
+    #[test]
+    fn a_damaged_database_reports_errors_instead_of_panicking() {
+        let mut s = Store::open_in_memory().unwrap();
+        s.insert(&sample(1)).unwrap();
+        s.conn.execute_batch("DROP TABLE samples; DROP TABLE why_log;").unwrap();
+        assert!(s.window(0, 10).is_err());
+        assert!(s.window_light(0, 10).is_err());
+        assert!(s.stats().is_err());
+        assert!(s.best_mhz().is_err());
+        assert!(s.insert(&sample(2)).is_err());
+        assert!(s.maintain(100, 7).is_err());
+        assert!(s.why_log().is_err());
+        assert!(s.log_why(1, 0, 1, &[], "x").is_err());
+        assert!(s.set_verdict("right", None).is_err());
+    }
+
+    #[test]
+    fn a_database_from_a_newer_version_is_opened_without_downgrading_it() {
+        let dir = temp_path("newer");
+        let path = dir.join("bb.db");
+        {
+            let mut s = Store::open(&path).unwrap();
+            s.insert(&sample(7)).unwrap();
+            s.conn.execute_batch("PRAGMA user_version = 99").unwrap();
+        }
+        let s = Store::open(&path).unwrap();
+        let v: i64 = s.conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+        assert_eq!(v, 99);
+        assert_eq!(s.window(7, 7).unwrap()[0], sample(7));
+        drop(s);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
 
 

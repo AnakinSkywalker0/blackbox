@@ -71,7 +71,7 @@ Status: **v0.5.1 released**, with `bb fix`, `bb blame` and the desktop window. A
 | **`bb explain`** | Diagnose error text pasted from anywhere. | Done: file, stdin or `--clipboard`; the same rules and wording as `bb why`. |
 | **MCP server** | Let an AI agent ask bb about a failed build. | Done: read-only `bb mcp serve` with four tools. Not yet run inside a real MCP client. |
 | **`bb watch <command>`** | Capture output live and diagnose on failure. | Done: live output, the command's own exit code, saved with its output, Ctrl-C without a diagnosis. |
-| **GitHub Action** | Comment the diagnosis on a failed CI job. | Planned. |
+| **GitHub Action** | Comment the diagnosis on a failed CI job. | Done in the repo (`action.yml`, `docs/ci/blackbox-diagnose.yml`), tested offline in `--print` mode. Not yet run against real GitHub, and needs a release that includes `bb explain`. |
 
 ---
 

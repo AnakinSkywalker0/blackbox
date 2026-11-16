@@ -1,0 +1,30 @@
+# Paste this into .github/workflows/ of your project.
+#
+# When your CI workflow fails on a pull request, blackbox reads the failed job's log and
+# comments a plain-English diagnosis on the PR. Re-runs update that one comment instead
+# of adding more, and when the workflow passes again the comment says so.
+#
+# It runs as a separate workflow_run workflow so it can comment on pull requests from
+# forks safely: it never checks out or runs the PR's code, and the log is only read as data.
+name: blackbox diagnose
+
+on:
+  workflow_run:
+    workflows: ["CI"]            # <- the name of the workflow to diagnose
+    types: [completed]
+
+permissions:
+  actions: read                  # read the failed run's log
+  pull-requests: write           # comment on the pull request
+
+jobs:
+  diagnose:
+    # Failures get a diagnosis; a pass updates an earlier failure comment if there is one.
+    if: github.event.workflow_run.conclusion == 'failure' || github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest       # ubuntu or macos; the log can come from any OS
+    steps:
+      # Pin to a release of blackbox that includes `bb explain`, and set bb-version to match.
+      - uses: AnakinSkywalker0/blackbox@main
+        with:
+          bb-version: latest
+          # dry-run: "true"      # uncomment to log what would be posted instead of posting

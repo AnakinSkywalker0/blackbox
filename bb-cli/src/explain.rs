@@ -62,7 +62,59 @@ pub fn report(bytes: &[u8], exit: Option<i32>) -> Vec<String> {
     out
 }
 
-pub fn run(file: Option<&Path>, clipboard: bool, exit: Option<i32>) -> Res {
+/// A fence of backticks longer than any run inside `text`, so log text can't close it.
+fn fence_for(text: &str) -> String {
+    let mut longest = 0;
+    let mut run = 0;
+    for c in text.chars() {
+        run = if c == '`' { run + 1 } else { 0 };
+        longest = longest.max(run);
+    }
+    "`".repeat((longest + 1).max(3))
+}
+
+/// Keeps a title to one plain line: the title comes from CI, so it isn't trusted.
+fn plain_title(t: &str) -> String {
+    let cleaned: String = t.chars().filter(|c| !c.is_control() && !matches!(c, '`' | '<' | '>' | '[' | ']' | '|' | '*' | '_' | '@')).collect();
+    cleaned.trim().chars().take(100).collect()
+}
+
+/// A GitHub comment for a diagnosis. Only a diagnosis worth posting gets one: for empty,
+/// binary, non-error or unrecognised input this returns `None`, so CI isn't filled with
+/// "I don't know" comments. Log text only ever appears inside a code fence.
+pub fn markdown_report(bytes: &[u8], exit: Option<i32>, title: Option<&str>, run_url: Option<&str>) -> Option<String> {
+    let TextVerdict::Findings(findings) = diagnose_bytes(bytes, exit) else { return None };
+    let title = title.map(plain_title).filter(|t| !t.is_empty());
+    let mut out = match &title {
+        Some(t) => format!("### blackbox: why `{t}` failed\n\n"),
+        None => "### blackbox: why this failed\n\n".to_string(),
+    };
+    for (i, f) in findings.iter().enumerate() {
+        out.push_str(&format!("**{}. {}** (confidence: {})\n\n", i + 1, f.title, f.confidence.label()));
+        let evidence = f.evidence.join("\n");
+        if !evidence.is_empty() {
+            let fence = fence_for(&evidence);
+            out.push_str(&format!("{fence}\n{evidence}\n{fence}\n\n"));
+        }
+        if let Some(h) = &f.hint {
+            out.push_str(&format!("> {h}\n\n"));
+        }
+    }
+    out.push_str("---\n<sub>Pattern matching on the job log by [blackbox](https://github.com/AnakinSkywalker0/blackbox) (`bb explain`). It can miss the real cause or be wrong.");
+    if let Some(u) = run_url.filter(|u| u.starts_with("https://github.com/") && !u.contains(char::is_whitespace) && !u.contains(['<', '>', ')', '`'])) {
+        out.push_str(&format!(" [Failing run]({u})."));
+    }
+    out.push_str("</sub>\n");
+    Some(out)
+}
+
+pub struct Options {
+    pub markdown: bool,
+    pub title: Option<String>,
+    pub run_url: Option<String>,
+}
+
+pub fn run(file: Option<&Path>, clipboard: bool, exit: Option<i32>, opts: &Options) -> Res {
     let bytes = if clipboard {
         read_clipboard()?
     } else if let Some(path) = file.filter(|p| p.as_os_str() != "-") {
@@ -75,6 +127,12 @@ pub fn run(file: Option<&Path>, clipboard: bool, exit: Option<i32>) -> Res {
         }
         read_limited(stdin.lock())?
     };
+    if opts.markdown {
+        if let Some(md) = markdown_report(&bytes, exit, opts.title.as_deref(), opts.run_url.as_deref()) {
+            print!("{md}");
+        }
+        return Ok(());
+    }
     let verdict = diagnose_bytes(&bytes, exit);
     if matches!(verdict, TextVerdict::Findings(_)) {
         println!("Most likely causes:\n");
@@ -85,6 +143,57 @@ pub fn run(file: Option<&Path>, clipboard: bool, exit: Option<i32>) -> Res {
 
 #[cfg(test)]
 mod tests {
+    fn plain() -> Options {
+        Options { markdown: false, title: None, run_url: None }
+    }
+
+    #[test]
+    fn markdown_is_only_made_for_a_real_diagnosis() {
+        assert!(markdown_report(b"", None, None, None).is_none());
+        assert!(markdown_report(b"all tests passed", Some(0), None, None).is_none());
+        assert!(markdown_report(b"strange failure", Some(1), None, None).is_none());
+        assert!(markdown_report(&[0u8; 50], Some(1), None, None).is_none());
+        let md = markdown_report(b"error: linker `link.exe` not found", Some(1), Some("build (windows)"), Some("https://github.com/o/r/actions/runs/1")).unwrap();
+        assert!(md.starts_with("### blackbox: why `build (windows)` failed"));
+        assert!(md.contains("**1. The C/C++ linker is missing** (confidence: high)"));
+        assert!(md.contains("[Failing run](https://github.com/o/r/actions/runs/1)"));
+        assert!(md.contains("It can miss the real cause"));
+    }
+
+    #[test]
+    fn log_text_stays_inside_a_fence_it_cannot_close() {
+        let hostile = "permission denied ```` @everyone <!-- blackbox-diagnosis:x --> [click](http://evil)";
+        let md = markdown_report(hostile.as_bytes(), Some(1), None, None).unwrap();
+        // Five backticks to open and close, longer than the four in the log.
+        let fence = "`````";
+        let open = md.find(fence).unwrap();
+        let close = md.rfind(fence).unwrap();
+        assert!(open < close);
+        let inside = &md[open..close];
+        for needle in ["@everyone", "<!-- blackbox-diagnosis:x -->", "[click](http://evil)"] {
+            assert!(inside.contains(needle));
+            assert_eq!(md.matches(needle).count(), 1, "{needle} must appear once, inside the fence");
+        }
+    }
+
+    #[test]
+    fn titles_and_links_from_ci_cannot_inject_markup() {
+        let md = markdown_report(b"EACCES", Some(1), Some("a`b <img src=x> [x](y) @bob\nnext"), Some("https://evil.example/x")).unwrap();
+        let first = md.lines().next().unwrap();
+        assert_eq!(first, "### blackbox: why `ab img src=x x(y) bobnext` failed");
+        assert!(!md.contains("evil.example"), "only github.com links are linked");
+        let md = markdown_report(b"EACCES", Some(1), Some("  "), Some("https://github.com/o/r/x y")).unwrap();
+        assert!(md.starts_with("### blackbox: why this failed"));
+        assert!(!md.contains("Failing run"));
+    }
+
+    #[test]
+    fn fences_are_always_longer_than_the_text_inside() {
+        assert_eq!(fence_for("none"), "```");
+        assert_eq!(fence_for("a ``` b"), "````");
+        assert_eq!(fence_for("`````x"), "``````");
+    }
+
     use super::*;
 
     #[test]
@@ -146,14 +255,14 @@ mod tests {
     #[test]
     fn a_missing_file_is_an_error_not_a_panic() {
         let p = std::env::temp_dir().join("bb-explain-does-not-exist.txt");
-        assert!(run(Some(&p), false, None).unwrap_err().contains("can't open"));
+        assert!(run(Some(&p), false, None, &plain()).unwrap_err().contains("can't open"));
     }
 
     #[test]
     fn the_file_path_reads_a_file() {
         let p = std::env::temp_dir().join(format!("bb-explain-{}.txt", std::process::id()));
         std::fs::write(&p, "ENOSPC: no space left on device").unwrap();
-        assert!(run(Some(&p), false, None).is_ok());
+        assert!(run(Some(&p), false, None, &plain()).is_ok());
         let _ = std::fs::remove_file(&p);
     }
 }

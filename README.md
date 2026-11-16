@@ -341,6 +341,40 @@ It speaks the current protocol revision (2026-07-28, stateless, with `server/dis
 
 `bb watch` reads the command's output through pipes so it can keep it, which means programs that only colour or animate their output on a real terminal print it plainly. It runs programs, not shell built-ins: for those, use `bb watch cmd /c ...` or `bb watch powershell -Command ...`. On Windows it finds `npm`, `yarn` and other `.cmd` programs the way the shell does. Ctrl-C handling is tested on Windows by setting the interrupt flag directly. A test that sends a real SIGINT exists for Linux and macOS but has not been run yet, and nobody has pressed a real Ctrl-C in a Windows terminal against it yet.
 
+### Diagnose failed CI on pull requests (GitHub Action)
+
+The `AnakinSkywalker0/blackbox` action reads the log of a failed workflow run and comments a plain-English diagnosis on its pull request. It posts **one comment per workflow** and updates it on re-runs, and if the workflow later passes it edits that comment to say so. If blackbox has nothing useful to say (it doesn't recognise the error, or there is no pull request), it posts nothing.
+
+Copy [docs/ci/blackbox-diagnose.yml](docs/ci/blackbox-diagnose.yml) into your project's `.github/workflows/` and change `workflows: ["CI"]` to the name of the workflow you want diagnosed:
+
+```yaml
+name: blackbox diagnose
+on:
+  workflow_run:
+    workflows: ["CI"]
+    types: [completed]
+permissions:
+  actions: read
+  pull-requests: write
+jobs:
+  diagnose:
+    if: github.event.workflow_run.conclusion == 'failure' || github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: AnakinSkywalker0/blackbox@main
+```
+
+| Input | Default | What it does |
+|---|---|---|
+| `bb-version` | `latest` | `latest` or a version like `0.6.0`. It must be a release that includes `bb explain`; v0.5.1 does not, and the action warns and posts nothing |
+| `bb-path` | | Use a `bb` you built yourself instead of downloading one |
+| `dry-run` | `false` | `true` logs what would be posted (with the exact comment text) and posts nothing |
+| `max-log-kb` | `256` | How much of the end of the failure log is read |
+
+**Safe by design.** It is a separate `workflow_run` workflow, so it can comment on pull requests from forks without ever checking out or running their code; the log is only fed to `bb explain` as data. Log text only appears inside a code fence the log can't close, and only comments written by a bot and starting with the action's marker are ever edited. The download is checked against its published SHA-256. Every step is `continue-on-error`, the scripts always exit 0, and any problem (no `bb`, an unreadable log, a GitHub API error) posts nothing and leaves your build result alone. It does not comment on runs that have no pull request, such as pushes to a branch or runs from forks (GitHub doesn't link those to a PR).
+
+**Checking it for real.** The script's decisions (create or update, same or changed, nothing to say, `bb` broken) are tested offline in `--print` mode. The calls to GitHub are not testable without GitHub, so the first time you use it: set `dry-run: "true"`, open a pull request that fails, and check the job log for `would CREATE a comment on PR #N` with a sensible diagnosis. Then remove `dry-run`, re-run the failed workflow, and confirm the same comment is updated rather than a second one added. This has not yet been done against a real repository.
+
 The error diagnosis is pattern matching on the text, and says so: it names a cause only when it can point at the line that shows it, and otherwise says it doesn't recognise the error. Output is stored only for commands run through `bb watch`; a shell hook can record that a command failed but not what it printed. Stored output is cut to its last 64 KB.
 
 ---

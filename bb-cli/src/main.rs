@@ -1,4 +1,5 @@
 mod blame;
+mod ci;
 mod explain;
 mod failures;
 mod fix;
@@ -167,6 +168,15 @@ enum Cmd {
         /// The exit code the command returned, if you know it
         #[arg(long, allow_hyphen_values = true)]
         exit: Option<i32>,
+        /// Print a GitHub comment instead (nothing at all when there is no diagnosis worth posting)
+        #[arg(long)]
+        markdown: bool,
+        /// With --markdown: the job name to put in the heading
+        #[arg(long, requires = "markdown")]
+        title: Option<String>,
+        /// With --markdown: a github.com link to the failing run
+        #[arg(long, requires = "markdown")]
+        run_url: Option<String>,
     },
     /// Run a command, show its output live, and if it fails say why (exits with the command's own code)
     Watch {
@@ -176,6 +186,12 @@ enum Cmd {
         /// The command and its arguments, for example: bb watch cargo build
         #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true, num_args = 1..)]
         command: Vec<String>,
+    },
+    /// Used by the GitHub Action's script. Not meant to be run by hand
+    #[command(hide = true)]
+    Ci {
+        #[command(subcommand)]
+        cmd: CiCmd,
     },
     /// Let an AI agent ask blackbox why a command failed (a read-only MCP server)
     Mcp {
@@ -213,6 +229,18 @@ enum Cmd {
         /// How long to measure, in seconds
         #[arg(long, default_value_t = 15)]
         secs: u64,
+    },
+}
+
+#[derive(Subcommand)]
+enum CiCmd {
+    /// Reads a pull request's comments (JSON) on stdin and says which one, if any, to update
+    PickComment {
+        #[arg(long)]
+        marker: String,
+        /// File holding the comment we are about to post
+        #[arg(long)]
+        body_file: PathBuf,
     },
 }
 
@@ -283,8 +311,9 @@ fn main() {
         Cmd::Heat { cmd: Some(HeatCmd::Test { yes }) } => heat::test(&db, yes),
         Cmd::Heat { cmd: None } => heat::history(&db),
         Cmd::Failures { limit } => failures::list(&db, limit),
-        Cmd::Explain { file, clipboard, exit } => explain::run(file.as_deref(), clipboard, exit),
+        Cmd::Explain { file, clipboard, exit, markdown, title, run_url } => explain::run(file.as_deref(), clipboard, exit, &explain::Options { markdown, title, run_url }),
         Cmd::Watch { no_record, command } => watch::run(&db, &command, !no_record),
+        Cmd::Ci { cmd: CiCmd::PickComment { marker, body_file } } => ci::pick_comment(&marker, &body_file),
         Cmd::Mcp { cmd: McpCmd::Serve } => mcp::serve(&db),
         Cmd::Hook { cmd } => match cmd {
             HookCmd::Install { shell, profile } => hook::install(&shell, profile.as_deref()),

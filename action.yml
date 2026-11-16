@@ -1,0 +1,59 @@
+name: blackbox diagnose
+description: >-
+  Comment a plain-English diagnosis of a failed CI run on its pull request, and update
+  that one comment on re-runs. Posts nothing, and never fails your workflow, if blackbox
+  can't help.
+author: AnakinSkywalker0
+branding:
+  icon: activity
+  color: gray-dark
+
+inputs:
+  github-token:
+    description: Token used to read the failed run's log and comment on the pull request.
+    default: ${{ github.token }}
+  run-id:
+    description: The workflow run to diagnose. Defaults to the run that triggered a workflow_run workflow.
+    default: ${{ github.event.workflow_run.id }}
+  bb-version:
+    description: "Release of bb to use: 'latest' or a version like 0.6.0. It must include `bb explain`."
+    default: latest
+  bb-path:
+    description: Use this bb binary instead of downloading one (for example one you just built).
+    default: ""
+  max-log-kb:
+    description: How much of the end of the failure log to read.
+    default: "256"
+  dry-run:
+    description: "'true' prints what would be posted instead of posting."
+    default: "false"
+
+runs:
+  using: composite
+  steps:
+    - name: Install bb
+      shell: bash
+      continue-on-error: true
+      env:
+        BB_VERSION: ${{ inputs.bb-version }}
+        BB_PATH: ${{ inputs.bb-path }}
+      run: bash "${{ github.action_path }}/.github/blackbox/install.sh"
+
+    - name: Diagnose and comment
+      shell: bash
+      continue-on-error: true
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+        BB_RUN_ID: ${{ inputs.run-id }}
+        MAX_LOG_KB: ${{ inputs.max-log-kb }}
+        DRY_RUN: ${{ inputs.dry-run }}
+        WORKFLOW_NAME: ${{ github.event.workflow_run.name }}
+        CONCLUSION: ${{ github.event.workflow_run.conclusion }}
+        RUN_URL: ${{ github.event.workflow_run.html_url }}
+        PR_NUMBERS: ${{ join(github.event.workflow_run.pull_requests.*.number, ' ') }}
+      run: |
+        if [ "$DRY_RUN" = "true" ]; then
+          bash "${{ github.action_path }}/.github/blackbox/diagnose.sh" --print
+        else
+          bash "${{ github.action_path }}/.github/blackbox/diagnose.sh"
+        fi

@@ -1,4 +1,5 @@
 mod blame;
+mod explain;
 mod failures;
 mod fix;
 mod heat;
@@ -154,6 +155,17 @@ enum Cmd {
         #[arg(short = 'n', long, default_value_t = 10)]
         limit: u32,
     },
+    /// Explain error text from a file, stdin or the clipboard, in the same words `bb why` uses
+    Explain {
+        /// File with the error text ("-" or nothing reads stdin)
+        file: Option<PathBuf>,
+        /// Read the clipboard instead
+        #[arg(long, short)]
+        clipboard: bool,
+        /// The exit code the command returned, if you know it
+        #[arg(long, allow_hyphen_values = true)]
+        exit: Option<i32>,
+    },
     /// Notice failed commands in your shell and offer `bb why` (edits your shell profile, with a backup)
     Hook {
         #[command(subcommand)]
@@ -249,6 +261,7 @@ fn main() {
         Cmd::Heat { cmd: Some(HeatCmd::Test { yes }) } => heat::test(&db, yes),
         Cmd::Heat { cmd: None } => heat::history(&db),
         Cmd::Failures { limit } => failures::list(&db, limit),
+        Cmd::Explain { file, clipboard, exit } => explain::run(file.as_deref(), clipboard, exit),
         Cmd::Hook { cmd } => match cmd {
             HookCmd::Install { shell, profile } => hook::install(&shell, profile.as_deref()),
             HookCmd::Uninstall { shell, profile } => hook::uninstall(&shell, profile.as_deref()),

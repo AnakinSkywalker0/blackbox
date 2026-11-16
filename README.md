@@ -300,6 +300,7 @@ blackbox can also remember commands that failed, and explain them next to the ma
 | Command | What it does |
 |---|---|
 | `bb failures [-n 10]` | Lists the most recent failed commands: when, exit code, command |
+| `bb explain [FILE]` | Diagnoses error text you didn't capture: from a file, from stdin (`some-command 2>&1 \| bb explain`), or with `--clipboard`. `--exit N` adds the exit code as evidence. It uses the same rules and wording as `bb why`, says "nothing looks like an error" for ordinary text, and refuses empty or binary input instead of guessing. Reads UTF-16 files, which is what PowerShell 5.1 writes for `2> errors.txt` |
 | `bb hook install <shell>` | Adds a few lines to your shell profile (`powershell`, `bash` or `zsh`) so that when a command fails, one line offering `bb why` is printed and the failure is recorded. It never runs a diagnosis or a fix for you |
 | `bb hook uninstall <shell>` / `bb hook status` | Remove it, leaving the rest of your profile as it was; or show where it is installed |
 | `bb why [WHEN]` | Unchanged, plus a "Failed commands in this window" section when any were recorded then. For each: what the error text says (when it was captured) and whether the machine was also struggling while it ran |

@@ -21,31 +21,47 @@ fn short(s: &str, max: usize) -> String {
 }
 
 /// The numbered "cause / evidence / hint" block, in the same shape `bb why` uses.
-pub fn print_findings(findings: &[Finding], indent: &str) {
+pub fn findings_lines(findings: &[Finding]) -> Vec<String> {
+    let mut out = Vec::new();
     for (i, f) in findings.iter().enumerate() {
-        println!("{indent}{:>2}. [{}] {}", i + 1, f.confidence.label(), f.title);
+        out.push(format!("{:>2}. [{}] {}", i + 1, f.confidence.label(), f.title));
         for e in &f.evidence {
-            println!("{indent}      - {e}");
+            out.push(format!("      - {e}"));
         }
         if let Some(h) = &f.hint {
-            println!("{indent}      > {h}");
+            out.push(format!("      > {h}"));
         }
+    }
+    out
+}
+
+pub fn print_findings(findings: &[Finding], indent: &str) {
+    for l in findings_lines(findings) {
+        println!("{indent}{l}");
+    }
+}
+
+/// What to say about one piece of text. Shared by `bb why` (for a recorded failure) and
+/// `bb explain` (for pasted text), so the same text always gets the same answer.
+pub fn verdict_lines(verdict: &TextVerdict, had_text: bool) -> Vec<String> {
+    match verdict {
+        TextVerdict::Empty => {
+            let why = if had_text { "nothing but blank space" } else { "no output" };
+            vec![format!("Nothing to diagnose: {why}.")]
+        }
+        TextVerdict::Binary => vec!["This looks like binary data, not text, so there is nothing to diagnose.".into()],
+        TextVerdict::NoError => vec!["Nothing in this looks like an error.".into()],
+        TextVerdict::Unrecognised { exit_code } => {
+            vec![format!("Exit code {exit_code}, and the text matches no error blackbox knows. It can't say why this failed.")]
+        }
+        TextVerdict::Findings(f) => findings_lines(f),
     }
 }
 
 /// Prints what is known about one failure. Honest about what it could not tell.
 pub fn print_verdict(verdict: &TextVerdict, had_text: bool, indent: &str) {
-    match verdict {
-        TextVerdict::Empty => {
-            let why = if had_text { "nothing but blank space" } else { "no output" };
-            println!("{indent}Nothing to diagnose: {why}.");
-        }
-        TextVerdict::Binary => println!("{indent}This looks like binary data, not text, so there is nothing to diagnose."),
-        TextVerdict::NoError => println!("{indent}Nothing in this looks like an error."),
-        TextVerdict::Unrecognised { exit_code } => {
-            println!("{indent}Exit code {exit_code}, and the text matches no error blackbox knows. It can't say why this failed.");
-        }
-        TextVerdict::Findings(f) => print_findings(f, indent),
+    for l in verdict_lines(verdict, had_text) {
+        println!("{indent}{l}");
     }
 }
 
@@ -110,5 +126,38 @@ mod tests {
         assert_eq!(short("a\nb", 10), "a");
         assert_eq!(short(&"x".repeat(100), 5), "xxxxx...");
         assert_eq!(short("", 5), "");
+    }
+
+    #[test]
+    fn a_pasted_error_and_a_recorded_failure_get_the_same_words() {
+        // `bb explain` and the failed-commands section of `bb why` both render through
+        // verdict_lines, so identical text can't be diagnosed two different ways.
+        let text = "error: linker `link.exe` not found
+  = note: program not found";
+        let pasted = verdict_lines(&diagnose_text(text, None), true);
+        let stored = verdict_lines(&diagnose_text(text, Some(1)), true);
+        assert_eq!(pasted, stored);
+        assert!(pasted[0].contains("[high] The C/C++ linker is missing"));
+        // Same shape as `bb why`: numbered, evidence with "-", advice with ">".
+        assert!(pasted[1].trim_start().starts_with("- "));
+        assert!(pasted[2].trim_start().starts_with("> "));
+    }
+
+    #[test]
+    fn every_kind_of_nothing_has_its_own_honest_sentence() {
+        let all: Vec<String> = [
+            TextVerdict::Empty,
+            TextVerdict::Binary,
+            TextVerdict::NoError,
+            TextVerdict::Unrecognised { exit_code: 4 },
+        ]
+        .iter()
+        .map(|v| verdict_lines(v, true).join(" "))
+        .collect();
+        for (i, a) in all.iter().enumerate() {
+            for b in &all[i + 1..] {
+                assert_ne!(a, b);
+            }
+        }
     }
 }

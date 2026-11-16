@@ -159,6 +159,31 @@ const RULES: &[Rule] = &[
     },
 ];
 
+/// Decodes bytes as text, or `None` when they are binary. Understands UTF-8 (with or
+/// without a byte order mark) and UTF-16 with one, which is what PowerShell 5.1 writes
+/// for `2> errors.txt`. A few undecodable bytes (an old code page) are tolerated.
+pub fn decode_text(bytes: &[u8]) -> Option<String> {
+    let utf16 = |b: &[u8], le: bool| {
+        let units: Vec<u16> = b
+            .chunks_exact(2)
+            .map(|c| if le { u16::from_le_bytes([c[0], c[1]]) } else { u16::from_be_bytes([c[0], c[1]]) })
+            .collect();
+        String::from_utf16_lossy(&units)
+    };
+    match bytes {
+        [0xFF, 0xFE, rest @ ..] => return Some(utf16(rest, true)),
+        [0xFE, 0xFF, rest @ ..] => return Some(utf16(rest, false)),
+        _ => {}
+    }
+    let bytes = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(bytes);
+    if let Ok(s) = std::str::from_utf8(bytes) {
+        return Some(s.to_string());
+    }
+    let lossy = String::from_utf8_lossy(bytes);
+    let bad = lossy.chars().filter(|c| *c == '\u{FFFD}').count();
+    (bad * 50 <= lossy.chars().count()).then(|| lossy.into_owned())
+}
+
 /// Removes terminal colour and cursor codes, which would split words the rules look for.
 pub fn strip_ansi(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
@@ -339,6 +364,23 @@ mod tests {
         assert_eq!(tail_utf8("abcdef", 3), "def");
         assert_eq!(tail_utf8("abc", 10), "abc");
         assert_eq!(tail_utf8("ééé", 3), "é");
+    }
+
+    #[test]
+    fn decoding_handles_bom_utf16_and_rejects_binary() {
+        assert_eq!(decode_text(b"hello").as_deref(), Some("hello"));
+        assert_eq!(decode_text(b"\xEF\xBB\xBFhello").as_deref(), Some("hello"));
+        let le: Vec<u8> = [0xFF, 0xFE].into_iter().chain("no such file".encode_utf16().flat_map(|u| u.to_le_bytes())).collect();
+        assert_eq!(decode_text(&le).as_deref(), Some("no such file"));
+        let be: Vec<u8> = [0xFE, 0xFF].into_iter().chain("ok".encode_utf16().flat_map(|u| u.to_be_bytes())).collect();
+        assert_eq!(decode_text(&be).as_deref(), Some("ok"));
+        // One stray byte in a long text (an old code page) is fine; mostly-invalid bytes are not.
+        let mut mostly = b"permission denied for the file you asked about, nothing else odd here ".to_vec();
+        mostly.push(0xE9);
+        assert!(decode_text(&mostly).is_some());
+        let junk: Vec<u8> = (0..400u32).map(|i| (i * 37 % 256) as u8 | 0x80).collect();
+        assert!(decode_text(&junk).is_none());
+        assert_eq!(decode_text(b"").as_deref(), Some(""));
     }
 
     #[test]

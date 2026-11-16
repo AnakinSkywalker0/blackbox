@@ -405,6 +405,25 @@ fn observed(samples: &[Sample]) -> String {
     format!("what it saw: CPU avg {cpu_avg:.0}% (max {cpu_max:.0}%), memory avg {mem_avg:.0}% (max {mem_max:.0}%), paging peak {paging:.0} pages/s, disk peak {disk} MB/s, disk busy peak {busy}")
 }
 
+/// The headline numbers as plain lines, for pasting into a README. A rate is only
+/// printed when something was judged, so "0%" never means "nothing was measured".
+fn score_lines(detected: usize, first: usize, judged: usize, controls_judged: usize, false_alarms: usize) -> Vec<String> {
+    let pct = |n: usize, d: usize| n as f64 * 100.0 / d as f64;
+    let mut out = vec!["Scores:".to_string()];
+    if judged == 0 {
+        out.push("  Detection accuracy: not measured (no slowdown could be judged)".into());
+    } else {
+        out.push(format!("  Detection accuracy: {:.0}% ({detected} of {judged} induced slowdowns named)", pct(detected, judged)));
+        out.push(format!("  Top-explanation accuracy: {:.0}% ({first} of {judged} ranked first)", pct(first, judged)));
+    }
+    if controls_judged == 0 {
+        out.push("  False-alarm rate: not measured (no quiet control run)".into());
+    } else {
+        out.push(format!("  False-alarm rate: {:.0}% ({false_alarms} of {controls_judged} quiet control run(s) reported a cause)", pct(false_alarms, controls_judged)));
+    }
+    out
+}
+
 // ---- the command --------------------------------------------------------------------
 
 pub fn run(only: &[String], include_memory: bool, recorder_running: bool) -> Res {
@@ -469,6 +488,10 @@ pub fn run(only: &[String], include_memory: bool, recorder_running: bool) -> Res
     let judged = induced.len() - unjudged;
     let false_alarms = outcomes.iter().filter(|o| o.name == "control" && o.status == Status::Fail).count();
     println!("\nDetected {detected} of {judged} induced slowdowns ({first} as the top explanation). False alarms on a quiet machine: {false_alarms}.");
+    let controls_judged = outcomes.iter().filter(|o| o.name == "control" && o.status != Status::Noisy).count();
+    for line in score_lines(detected, first, judged, controls_judged, false_alarms) {
+        println!("{line}");
+    }
     if noisy {
         println!("The machine was not quiet (something was really using it during the control run), so {unjudged} scenario(s) could not be judged. Close other programs and run again for a clean result.");
     }
@@ -491,6 +514,18 @@ pub fn run(only: &[String], include_memory: bool, recorder_running: bool) -> Res
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn scores_are_percentages_and_never_hide_an_unmeasured_rate() {
+        let l = score_lines(3, 2, 4, 1, 0);
+        assert!(l.iter().any(|x| x.contains("Detection accuracy: 75% (3 of 4")));
+        assert!(l.iter().any(|x| x.contains("Top-explanation accuracy: 50% (2 of 4")));
+        assert!(l.iter().any(|x| x.contains("False-alarm rate: 0% (0 of 1")));
+        let none = score_lines(0, 0, 0, 0, 0);
+        assert!(none.iter().any(|x| x.contains("Detection accuracy: not measured")));
+        assert!(none.iter().any(|x| x.contains("False-alarm rate: not measured")));
+        assert!(score_lines(1, 1, 1, 1, 1).iter().any(|x| x.contains("False-alarm rate: 100% (1 of 1")));
+    }
+
     use super::*;
 
     fn temp_dir(tag: &str) -> PathBuf {

@@ -424,9 +424,31 @@ fn score_lines(detected: usize, first: usize, judged: usize, controls_judged: us
     out
 }
 
+/// Where the last selftest's scores are kept: `selftest.json` beside the database.
+pub fn stats_path(db: &Path) -> PathBuf {
+    db.with_file_name("selftest.json")
+}
+
+fn save_stats(db: &Path, detected: usize, first: usize, judged: usize, controls_judged: usize, false_alarms: usize) -> std::io::Result<()> {
+    let rate = |n: usize, d: usize| if d == 0 { serde_json::Value::Null } else { serde_json::json!(n as f64 * 100.0 / d as f64) };
+    let v = serde_json::json!({
+        "ts": chrono::Local::now().timestamp(),
+        "version": env!("CARGO_PKG_VERSION"),
+        "detected": detected,
+        "ranked_first": first,
+        "judged": judged,
+        "controls_judged": controls_judged,
+        "false_alarms": false_alarms,
+        "detection_pct": rate(detected, judged),
+        "top_explanation_pct": rate(first, judged),
+        "false_alarm_pct": rate(false_alarms, controls_judged),
+    });
+    std::fs::write(stats_path(db), serde_json::to_string_pretty(&v)?)
+}
+
 // ---- the command --------------------------------------------------------------------
 
-pub fn run(only: &[String], include_memory: bool, recorder_running: bool) -> Res {
+pub fn run(only: &[String], include_memory: bool, recorder_running: bool, db: &Path) -> Res {
     raise_priority();
     // Earlier versions left up to 2 GB per run in the temp folder. Clear those out.
     let freed = sweep_stale_scratch(&std::env::temp_dir(), Duration::from_secs(600));
@@ -492,6 +514,8 @@ pub fn run(only: &[String], include_memory: bool, recorder_running: bool) -> Res
     for line in score_lines(detected, first, judged, controls_judged, false_alarms) {
         println!("{line}");
     }
+    // Remembered beside the database so other tools (the MCP server) can report it.
+    let _ = save_stats(db, detected, first, judged, controls_judged, false_alarms);
     if noisy {
         println!("The machine was not quiet (something was really using it during the control run), so {unjudged} scenario(s) could not be judged. Close other programs and run again for a clean result.");
     }
@@ -514,6 +538,21 @@ pub fn run(only: &[String], include_memory: bool, recorder_running: bool) -> Res
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn scores_are_saved_next_to_the_database_and_unmeasured_rates_are_null() {
+        let dir = temp_dir("stats");
+        let db = dir.join("bb.db");
+        save_stats(&db, 3, 2, 4, 1, 0).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(stats_path(&db)).unwrap()).unwrap();
+        assert_eq!(v["detected"], 3);
+        assert_eq!(v["detection_pct"], 75.0);
+        assert_eq!(v["false_alarm_pct"], 0.0);
+        save_stats(&db, 0, 0, 0, 0, 0).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(stats_path(&db)).unwrap()).unwrap();
+        assert!(v["detection_pct"].is_null() && v["false_alarm_pct"].is_null());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn scores_are_percentages_and_never_hide_an_unmeasured_rate() {
         let l = score_lines(3, 2, 4, 1, 0);

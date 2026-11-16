@@ -65,24 +65,52 @@ pub fn print_verdict(verdict: &TextVerdict, had_text: bool, indent: &str) {
     }
 }
 
-/// One failed command with its diagnosis: the text (if it was captured) and what the
-/// machine was doing while it ran (if the recorder was on).
+/// Everything known about why one failed command failed.
+pub struct FailureDiagnosis {
+    /// The words to print: what the error text (or, failing that, the exit code) says.
+    pub lines: Vec<String>,
+    /// The same as structured findings (empty when nothing was recognised).
+    pub findings: Vec<Finding>,
+    /// What the machine was doing while it ran, from the vitals recorder.
+    pub context: Vec<Finding>,
+}
+
+/// The text (if it was captured) and what the machine was doing while the command ran
+/// (if the recorder was on). Shared by `bb why` and the MCP server.
+pub fn diagnose_failure(store: &Store, f: &Failure) -> FailureDiagnosis {
+    let (lines, findings) = match &f.output {
+        Some(text) => {
+            let v = diagnose_text(text, Some(f.exit_code));
+            let findings = match &v {
+                TextVerdict::Findings(fs) => fs.clone(),
+                _ => Vec::new(),
+            };
+            (verdict_lines(&v, true), findings)
+        }
+        // Nothing was captured, so only the exit code can speak.
+        None => match exit_code_finding(f.exit_code) {
+            Some(code) => (findings_lines(std::slice::from_ref(&code)), vec![code]),
+            None => (
+                vec!["Only the exit code was recorded (the shell hook can't see output). `bb watch <command>` captures it.".to_string()],
+                Vec::new(),
+            ),
+        },
+    };
+    let context = machine_context(store, f).unwrap_or_default();
+    FailureDiagnosis { lines, findings, context }
+}
+
+/// One failed command with its diagnosis.
 pub fn print_failure(store: &Store, f: &Failure) {
     let took = f.duration_ms.map(|ms| format!(", {:.1}s", ms as f64 / 1000.0)).unwrap_or_default();
     println!("  {}  exit {}  {}{took}", clock(f.ts), f.exit_code, short(&f.command, 70));
-    match &f.output {
-        Some(text) => print_verdict(&diagnose_text(text, Some(f.exit_code)), true, "    "),
-        // Nothing was captured, so only the exit code can speak.
-        None => match exit_code_finding(f.exit_code) {
-            Some(code) => print_findings(&[code], "    "),
-            None => println!("    Only the exit code was recorded (the shell hook can't see output). `bb watch <command>` captures it."),
-        },
+    let d = diagnose_failure(store, f);
+    for l in &d.lines {
+        println!("    {l}");
     }
-    if let Ok(ctx) = machine_context(store, f) {
-        if !ctx.is_empty() {
-            println!("    The machine was also struggling while it ran:");
-            print_findings(&ctx, "    ");
-        }
+    if !d.context.is_empty() {
+        println!("    The machine was also struggling while it ran:");
+        print_findings(&d.context, "    ");
     }
 }
 

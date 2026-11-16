@@ -309,6 +309,35 @@ blackbox can also remember commands that failed, and explain them next to the ma
 
 PowerShell won't load any profile under the Restricted or AllSigned execution policy; `bb hook install` warns when that's your policy. The hook only sees exit codes, not output. A PowerShell error that isn't a program's exit code is recorded as exit 1. The zsh hook is written and unit-tested but has not been run in a real zsh yet.
 
+### Letting an AI agent ask (`bb mcp serve`)
+
+`bb mcp serve` is a [Model Context Protocol](https://modelcontextprotocol.io) server over stdio, so Claude Code, Claude Desktop and other MCP clients can ask blackbox why a build failed. It is **read-only**: it opens the database with SQLite's read-only flag, so it can't change your recording, and it never runs a fix. It sends nothing anywhere; the client talks to it over its own pipe.
+
+| Tool | What it returns |
+|---|---|
+| `recent_failures` | The latest failed commands (`limit`, default 10) |
+| `why` | A diagnosis of one failure (`failure_id`, or `latest_failure: true`), or of a moment (`when`, `span`, as in `bb why`) |
+| `explain` | A diagnosis of error `text` the agent already has (optional `exit_code`) |
+| `selftest_stats` | Detection accuracy and false-alarm rate from the last `bb selftest` |
+
+Every tool returns readable text plus structured JSON. Claude Code:
+
+```
+claude mcp add blackbox -- bb mcp serve
+```
+
+Other clients: paste this into the client's MCP settings (`bb` must be on PATH, which the installer and winget do):
+
+```json
+{
+  "mcpServers": {
+    "blackbox": { "command": "bb", "args": ["mcp", "serve"] }
+  }
+}
+```
+
+It speaks the current protocol revision (2026-07-28, stateless, with `server/discover`) and the older `initialize` handshake that most clients still use. It has been tested against its own protocol tests and by hand over stdio; it has not yet been run inside a real MCP client. Use `bb --db <file> mcp serve` to point it at a different database.
+
 The error diagnosis is pattern matching on the text, and says so: it names a cause only when it can point at the line that shows it, and otherwise says it doesn't recognise the error. Output is stored only for commands run through `bb watch`; a shell hook can record that a command failed but not what it printed. Stored output is cut to its last 64 KB.
 
 ---

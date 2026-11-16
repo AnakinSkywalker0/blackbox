@@ -5,6 +5,7 @@ mod fix;
 mod heat;
 mod hook;
 mod install;
+mod mcp;
 mod selftest;
 mod update;
 
@@ -166,6 +167,11 @@ enum Cmd {
         #[arg(long, allow_hyphen_values = true)]
         exit: Option<i32>,
     },
+    /// Let an AI agent ask blackbox why a command failed (a read-only MCP server)
+    Mcp {
+        #[command(subcommand)]
+        cmd: McpCmd,
+    },
     /// Notice failed commands in your shell and offer `bb why` (edits your shell profile, with a backup)
     Hook {
         #[command(subcommand)]
@@ -198,6 +204,12 @@ enum Cmd {
         #[arg(long, default_value_t = 15)]
         secs: u64,
     },
+}
+
+#[derive(Subcommand)]
+enum McpCmd {
+    /// Serve over stdio. Your MCP client starts this; it isn't meant to be run by hand
+    Serve,
 }
 
 #[derive(Subcommand)]
@@ -262,6 +274,7 @@ fn main() {
         Cmd::Heat { cmd: None } => heat::history(&db),
         Cmd::Failures { limit } => failures::list(&db, limit),
         Cmd::Explain { file, clipboard, exit } => explain::run(file.as_deref(), clipboard, exit),
+        Cmd::Mcp { cmd: McpCmd::Serve } => mcp::serve(&db),
         Cmd::Hook { cmd } => match cmd {
             HookCmd::Install { shell, profile } => hook::install(&shell, profile.as_deref()),
             HookCmd::Uninstall { shell, profile } => hook::uninstall(&shell, profile.as_deref()),
@@ -270,7 +283,7 @@ fn main() {
         },
         Cmd::Status => status(&db),
         Cmd::Sensors => sensors(),
-        Cmd::Selftest { only, memory } => selftest::run(&only, memory, install::running_pid(&db).is_some()),
+        Cmd::Selftest { only, memory } => selftest::run(&only, memory, install::running_pid(&db).is_some(), &db),
         Cmd::SelftestWorker { kind, secs, mb } => selftest::worker(&kind, secs, mb),
         Cmd::Bench { secs } => bench(secs),
     };
@@ -286,7 +299,7 @@ fn open(db: &std::path::Path) -> Result<Store, String> {
     Store::open(db).map_err(|e| format!("can't open database {}: {e}", db.display()))
 }
 
-fn fmt_time(ts: i64) -> String {
+pub(crate) fn fmt_time(ts: i64) -> String {
     match Local.timestamp_opt(ts, 0).single() {
         Some(t) => t.format("%a %H:%M:%S").to_string(),
         None => ts.to_string(),
@@ -425,17 +438,17 @@ fn top(n: usize, watch: bool) -> Res {
     }
 }
 
-fn why(db: &std::path::Path, when: &str, span: &str) -> Res {
-    let now: DateTime<Local> = Local::now();
+/// The time window `bb why WHEN --span SPAN` looks at.
+pub(crate) fn why_window(when: &str, span: &str, now: DateTime<Local>) -> Result<(i64, i64), String> {
     let centre = parse_when(when, now)?;
     let span = parse_duration(span)?.max(2);
     let half = span / 2;
     // "now" means the recent past, not a window that is half in the future.
-    let (from, to) = if centre >= now.timestamp() - 1 {
-        (centre - span, centre)
-    } else {
-        (centre - half, centre + half)
-    };
+    Ok(if centre >= now.timestamp() - 1 { (centre - span, centre) } else { (centre - half, centre + half) })
+}
+
+fn why(db: &std::path::Path, when: &str, span: &str) -> Res {
+    let (from, to) = why_window(when, span, Local::now())?;
 
     let store = open(db)?;
     let samples = store.window(from, to).map_err(|e| e.to_string())?;

@@ -73,6 +73,30 @@ impl Store {
         Self::init(Connection::open(path)?)
     }
 
+    /// Opens an existing database for reading only: nothing is created, migrated or
+    /// written, and SQLite itself refuses writes. For tools (the MCP server) that must
+    /// never change the recording. Fails if the file doesn't exist.
+    pub fn open_read_only(path: &Path) -> rusqlite::Result<Store> {
+        let conn = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
+        conn.execute_batch("PRAGMA query_only = ON")?;
+        Ok(Store { conn })
+    }
+
+    /// SQLite's own consistency check: "ok" when the file is sound.
+    pub fn integrity_check(&self) -> rusqlite::Result<String> {
+        self.conn.query_row("PRAGMA integrity_check", [], |r| r.get(0))
+    }
+
+    /// Whether this database has the failures table (databases written by older
+    /// versions don't until a newer `bb` opens them).
+    pub fn has_failures(&self) -> rusqlite::Result<bool> {
+        self.conn
+            .query_row("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'failures'", [], |_| Ok(()))
+            .optional()
+            .map(|r| r.is_some())
+    }
+
     pub fn open_in_memory() -> rusqlite::Result<Store> {
         Self::init(Connection::open_in_memory()?)
     }
@@ -183,6 +207,11 @@ impl Store {
         let mut st = self.conn.prepare(&sql)?;
         let rows = st.query_map([from, to], Self::failure_from_row)?;
         rows.collect()
+    }
+
+    pub fn failure(&self, id: i64) -> rusqlite::Result<Option<Failure>> {
+        let sql = format!("SELECT {} FROM failures WHERE id = ?1", Self::FAILURE_COLS);
+        self.conn.query_row(&sql, [id], Self::failure_from_row).optional()
     }
 
     /// The newest `limit` failures, newest first.
@@ -772,6 +801,48 @@ mod tests {
         let left = s.recent_failures(10).unwrap();
         assert_eq!(left.len(), 1);
         assert_eq!(left[0].command, "new");
+    }
+
+    #[test]
+    fn a_read_only_store_reads_but_refuses_every_write() {
+        let dir = temp_path("ro");
+        let path = dir.join("bb.db");
+        {
+            let mut s = Store::open(&path).unwrap();
+            s.insert(&sample(5)).unwrap();
+            s.insert_failure(&failure(6, "x")).unwrap();
+        }
+        let mut ro = Store::open_read_only(&path).unwrap();
+        assert_eq!(ro.window(5, 5).unwrap().len(), 1);
+        assert_eq!(ro.recent_failures(5).unwrap().len(), 1);
+        assert_eq!(ro.failure(1).unwrap().unwrap().command, "x");
+        assert!(ro.failure(99).unwrap().is_none());
+        assert!(ro.has_failures().unwrap());
+        assert!(ro.insert(&sample(7)).is_err());
+        assert!(ro.insert_failure(&failure(8, "y")).is_err());
+        assert!(ro.maintain(1_000_000_000, 7).is_err());
+        assert!(ro.log_why(1, 0, 1, &[], "x").is_err());
+        assert_eq!(ro.stats().unwrap().samples, 1);
+        drop(ro);
+        // It never creates a database that isn't there.
+        let missing = dir.join("nope.db");
+        assert!(Store::open_read_only(&missing).is_err());
+        assert!(!missing.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_read_only_store_copes_with_a_database_older_than_the_failures_table() {
+        let dir = temp_path("ro-old");
+        let path = dir.join("bb.db");
+        {
+            let s = Store::open(&path).unwrap();
+            s.conn.execute_batch("DROP TABLE failures; PRAGMA user_version = 4").unwrap();
+        }
+        let ro = Store::open_read_only(&path).unwrap();
+        assert!(!ro.has_failures().unwrap());
+        drop(ro);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn temp_path(tag: &str) -> PathBuf {

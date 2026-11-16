@@ -331,10 +331,19 @@ impl Store {
 
     /// Deletes data older than `retention_days`, and thins data older than 24h.
     /// Returns the number of samples removed.
+    ///
+    /// Both limits count back from the newest *recorded* sample (never from after
+    /// `now`), not from the wall clock. A machine that was off for 8 days must not
+    /// lose its history the moment the recorder starts again.
     pub fn maintain(&mut self, now: i64, retention_days: u32) -> rusqlite::Result<usize> {
         let tx = self.conn.transaction()?;
-        let cutoff = now - retention_days as i64 * 86400;
-        let thin_before = now - FULL_RES_SECS;
+        let newest: Option<i64> = tx.query_row("SELECT MAX(ts) FROM samples", [], |r| r.get(0))?;
+        let Some(newest) = newest else {
+            return Ok(0);
+        };
+        let anchor = newest.min(now);
+        let cutoff = anchor - retention_days as i64 * 86400;
+        let thin_before = anchor - FULL_RES_SECS;
         let mut removed = 0;
         removed += tx.execute("DELETE FROM samples WHERE ts < ?1", [cutoff])?;
         tx.execute("DELETE FROM procs WHERE ts < ?1", [cutoff])?;
@@ -583,6 +592,44 @@ mod tests {
         for ext in ["", "-wal", "-shm"] {
             let _ = std::fs::remove_file(format!("{}{ext}", path.display()));
         }
+    }
+
+    #[test]
+    fn a_long_gap_does_not_wipe_history() {
+        // The machine recorded for 2 days, was off for 10, then the recorder restarts.
+        let mut s = Store::open_in_memory().unwrap();
+        let last = 1_000_000_000;
+        for t in 0..60 {
+            s.insert(&sample(last - 86400 + t)).unwrap();
+        }
+        for t in 0..60 {
+            s.insert(&sample(last - 8 * 3600 + t)).unwrap();
+        }
+        let before = s.stats().unwrap().samples;
+        let removed = s.maintain(last + 10 * 86400, 7).unwrap();
+        assert_eq!(removed, 0, "nothing is older than 7 days of recorded time");
+        assert_eq!(s.stats().unwrap().samples, before);
+        assert_eq!(s.window(last - 86400, last - 86400 + 60).unwrap().len(), 60);
+    }
+
+    #[test]
+    fn retention_still_prunes_relative_to_the_newest_sample_after_a_gap() {
+        let mut s = Store::open_in_memory().unwrap();
+        let last = 1_000_000_000;
+        // 9 days of recorded time before the newest sample is beyond the 7-day limit.
+        for t in 0..10 {
+            s.insert(&sample(last - 9 * 86400 + t)).unwrap();
+        }
+        s.insert(&sample(last)).unwrap();
+        s.maintain(last + 20 * 86400, 7).unwrap();
+        assert_eq!(s.window(last - 9 * 86400, last - 9 * 86400 + 10).unwrap().len(), 0);
+        assert_eq!(s.window(last, last).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn maintain_on_an_empty_database_is_a_noop() {
+        let mut s = Store::open_in_memory().unwrap();
+        assert_eq!(s.maintain(1_000_000_000, 7).unwrap(), 0);
     }
 }
 

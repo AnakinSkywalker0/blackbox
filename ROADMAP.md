@@ -62,6 +62,19 @@ Status: **v0.5.1 released**, with `bb fix`, `bb blame` and the desktop window. A
 
 ---
 
+## 7. Failed commands
+
+| Item | Why | Status |
+|---|---|---|
+| **Failure store and text diagnosis** | A slowdown often shows up as a failed build or script, and the error text usually names the cause. | Done: `failures` table (schema 5), `bb failures`, and a failed-commands section in `bb why`. |
+| **Shell hook** | Notice a failed command without being asked. | Planned: `bb hook install/uninstall/status` for PowerShell, bash and zsh. |
+| **`bb explain`** | Diagnose error text pasted from anywhere. | Planned. |
+| **MCP server** | Let an AI agent ask bb about a failed build. | Planned: read-only `bb mcp serve`. |
+| **`bb watch <command>`** | Capture output live and diagnose on failure. | Planned. |
+| **GitHub Action** | Comment the diagnosis on a failed CI job. | Planned. |
+
+---
+
 ## Later
 
 - Snapshot installed apps, startup items, drivers and services over time, so `bb why` can say "this got slow after the 14 Sept driver update" even without the Event Log.

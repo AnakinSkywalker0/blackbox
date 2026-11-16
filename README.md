@@ -293,6 +293,17 @@ The Windows installer and `bb update` include the desktop window. On Linux and m
 | `bb fix` | Proposes safe, reversible fixes, asks before each one, and measures the effect: lower a CPU hog's priority; when memory is 80%+ full, lower the memory priority of a big background program so Windows pages it out before the app you're using; leave Power saver; trim start-at-login entries with `--only startup`. `--dry-run` only shows them, and `--undo` reverses the last batch. It never "cleans" RAM: forcing memory out of programs only moves it to the slower pagefile |
 | `bb-gui` | A desktop window laid out like a status page. Home says how the computer is doing right now, shows a 24-hour strip with slowdowns marked, and lists each slowdown as a card. Click one for the plain-English explanation, evidence, what you can do, and Yes/Partly/No feedback. The sidebar has a chart each for CPU, memory, disk, GPU and heat (with time spent over 80 and 90 C), plus Sensors. It follows the system light or dark mode. The installer adds Start-menu and desktop shortcuts |
 
+### Failed commands
+
+blackbox can also remember commands that failed, and explain them next to the machine's vitals.
+
+| Command | What it does |
+|---|---|
+| `bb failures [-n 10]` | Lists the most recent failed commands: when, exit code, command |
+| `bb why [WHEN]` | Unchanged, plus a "Failed commands in this window" section when any were recorded then. For each: what the error text says (when it was captured) and whether the machine was also struggling while it ran |
+
+The error diagnosis is pattern matching on the text, and says so: it names a cause only when it can point at the line that shows it, and otherwise says it doesn't recognise the error. Output is stored only for commands run through `bb watch`; a shell hook can record that a command failed but not what it printed. Stored output is cut to its last 64 KB.
+
 ---
 
 ## What `bb why` can explain
@@ -419,6 +430,7 @@ Thinning returns the space to the OS, so the file shrinks after the first day ra
 
 - Everything stays on your machine. blackbox makes **no network connections**, with one exception: `bb update`, which only runs when you type it. It asks GitHub for the latest release and downloads it. It sends no data about you or your machine (only a `bb/<version>` user agent).
 - It records program **names** and resource numbers. It does not record window titles, file names, keystrokes or screen contents.
+- If you use failed-command capture, it also stores the **command line**, the working folder, the exit code and (for `bb watch`) the tail of the command's output. Command lines can contain secrets such as tokens typed as arguments, so treat the database as sensitive. Capture is off until you install the hook or run `bb watch`.
 - To erase everything: delete the `bb.db` file (and the `bb.db-wal` / `bb.db-shm` files next to it) while `bb run` is stopped.
 
 ---

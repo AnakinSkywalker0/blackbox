@@ -1,4 +1,5 @@
 mod blame;
+mod failures;
 mod fix;
 mod heat;
 mod install;
@@ -146,6 +147,12 @@ enum Cmd {
         #[command(subcommand)]
         cmd: Option<HeatCmd>,
     },
+    /// List recent failed commands (recorded by the shell hook and `bb watch`)
+    Failures {
+        /// How many to show
+        #[arg(short = 'n', long, default_value_t = 10)]
+        limit: u32,
+    },
     /// Show what has been recorded
     Status,
     /// Show which sensors (battery, temperature, GPU, disk latency) work on this machine
@@ -203,6 +210,7 @@ fn main() {
         Cmd::Blame { days } => blame::run(&db, days),
         Cmd::Heat { cmd: Some(HeatCmd::Test { yes }) } => heat::test(&db, yes),
         Cmd::Heat { cmd: None } => heat::history(&db),
+        Cmd::Failures { limit } => failures::list(&db, limit),
         Cmd::Status => status(&db),
         Cmd::Sensors => sensors(),
         Cmd::Selftest { only, memory } => selftest::run(&only, memory, install::running_pid(&db).is_some()),
@@ -384,6 +392,7 @@ fn why(db: &std::path::Path, when: &str, span: &str) -> Res {
                 fmt_time(s.last_ts.unwrap_or(0))
             ),
         }
+        failures::print_in_window(&store, from, to);
         return Ok(());
     }
 
@@ -397,6 +406,7 @@ fn why(db: &std::path::Path, when: &str, span: &str) -> Res {
     if findings.is_empty() {
         println!("No clear cause. CPU, memory, disk, GPU, heat and power all looked normal in this window.");
         println!("Try a shorter or different --span. It may also be something blackbox can't see yet (network, or a sensor `bb sensors` shows as unavailable).");
+        failures::print_in_window(&store, from, to);
         println!("\n{ASK}");
         return Ok(());
     }
@@ -411,6 +421,7 @@ fn why(db: &std::path::Path, when: &str, span: &str) -> Res {
         }
         println!();
     }
+    failures::print_in_window(&store, from, to);
     println!("{ASK}");
     offer_fix(db, &titles)
 }

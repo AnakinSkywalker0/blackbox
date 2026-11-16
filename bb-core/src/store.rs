@@ -1,5 +1,6 @@
 //! Compact SQLite storage: insert, window queries, pruning and thinning.
 
+use crate::failure::{tail_utf8, Failure, MAX_OUTPUT_BYTES};
 use crate::model::{ProcRow, Sample, Sensors};
 use rusqlite::{params, Connection, OptionalExtension};
 use std::path::{Path, PathBuf};
@@ -133,7 +134,63 @@ impl Store {
             }
             conn.execute_batch("PRAGMA user_version = 4")?;
         }
+        if version < 5 {
+            // Failed commands, recorded by the shell hook and `bb watch`.
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS failures (
+                     id INTEGER PRIMARY KEY,
+                     ts INTEGER NOT NULL,
+                     command TEXT NOT NULL,
+                     exit_code INTEGER NOT NULL,
+                     cwd TEXT,
+                     output TEXT,           -- tail of what it printed, when captured
+                     duration_ms INTEGER
+                 );
+                 CREATE INDEX IF NOT EXISTS failures_ts ON failures(ts);
+                 PRAGMA user_version = 5;",
+            )?;
+        }
         Ok(())
+    }
+
+    /// Records a failed command and returns its id. The output is cut to its tail.
+    pub fn insert_failure(&self, f: &Failure) -> rusqlite::Result<i64> {
+        let output = f.output.as_deref().map(|o| tail_utf8(o, MAX_OUTPUT_BYTES));
+        self.conn.execute(
+            "INSERT INTO failures (ts, command, exit_code, cwd, output, duration_ms) VALUES (?1,?2,?3,?4,?5,?6)",
+            params![f.ts, f.command, f.exit_code, f.cwd, output, f.duration_ms],
+        )?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    fn failure_from_row(r: &rusqlite::Row) -> rusqlite::Result<Failure> {
+        Ok(Failure {
+            id: r.get(0)?,
+            ts: r.get(1)?,
+            command: r.get(2)?,
+            exit_code: r.get(3)?,
+            cwd: r.get(4)?,
+            output: r.get(5)?,
+            duration_ms: r.get(6)?,
+        })
+    }
+
+    const FAILURE_COLS: &'static str = "id, ts, command, exit_code, cwd, output, duration_ms";
+
+    /// Failures with `from <= ts <= to`, oldest first.
+    pub fn failures_between(&self, from: i64, to: i64) -> rusqlite::Result<Vec<Failure>> {
+        let sql = format!("SELECT {} FROM failures WHERE ts BETWEEN ?1 AND ?2 ORDER BY ts, id", Self::FAILURE_COLS);
+        let mut st = self.conn.prepare(&sql)?;
+        let rows = st.query_map([from, to], Self::failure_from_row)?;
+        rows.collect()
+    }
+
+    /// The newest `limit` failures, newest first.
+    pub fn recent_failures(&self, limit: u32) -> rusqlite::Result<Vec<Failure>> {
+        let sql = format!("SELECT {} FROM failures ORDER BY ts DESC, id DESC LIMIT ?1", Self::FAILURE_COLS);
+        let mut st = self.conn.prepare(&sql)?;
+        let rows = st.query_map([limit], Self::failure_from_row)?;
+        rows.collect()
     }
 
     pub fn insert(&mut self, s: &Sample) -> rusqlite::Result<()> {
@@ -337,8 +394,15 @@ impl Store {
     /// lose its history the moment the recorder starts again.
     pub fn maintain(&mut self, now: i64, retention_days: u32) -> rusqlite::Result<usize> {
         let tx = self.conn.transaction()?;
+        // Failures keep the same rule, counted from the newest failure, so a quiet spell
+        // never empties them.
+        tx.execute(
+            "DELETE FROM failures WHERE ts < (SELECT MAX(ts) FROM failures) - ?1",
+            [retention_days as i64 * 86400],
+        )?;
         let newest: Option<i64> = tx.query_row("SELECT MAX(ts) FROM samples", [], |r| r.get(0))?;
         let Some(newest) = newest else {
+            tx.commit()?;
             return Ok(0);
         };
         let anchor = newest.min(now);
@@ -630,6 +694,84 @@ mod tests {
     fn maintain_on_an_empty_database_is_a_noop() {
         let mut s = Store::open_in_memory().unwrap();
         assert_eq!(s.maintain(1_000_000_000, 7).unwrap(), 0);
+    }
+
+    fn failure(ts: i64, cmd: &str) -> Failure {
+        Failure { id: 0, ts, command: cmd.into(), exit_code: 1, cwd: Some("C:\\work".into()), output: None, duration_ms: Some(1500) }
+    }
+
+    #[test]
+    fn failures_roundtrip_in_time_order() {
+        let s = Store::open_in_memory().unwrap();
+        let a = s.insert_failure(&failure(100, "cargo build")).unwrap();
+        let b = s.insert_failure(&Failure { output: Some("boom".into()), ..failure(200, "npm test") }).unwrap();
+        assert!(b > a);
+        let all = s.failures_between(0, 1000).unwrap();
+        assert_eq!(all.iter().map(|f| f.command.as_str()).collect::<Vec<_>>(), ["cargo build", "npm test"]);
+        assert_eq!(all[1].output.as_deref(), Some("boom"));
+        assert_eq!(all[0].output, None);
+        assert_eq!(s.failures_between(150, 1000).unwrap().len(), 1);
+        let recent = s.recent_failures(1).unwrap();
+        assert_eq!(recent[0].command, "npm test");
+    }
+
+    #[test]
+    fn stored_output_is_cut_to_its_tail() {
+        let s = Store::open_in_memory().unwrap();
+        let big = format!("{}END", "x".repeat(MAX_OUTPUT_BYTES * 2));
+        s.insert_failure(&Failure { output: Some(big), ..failure(1, "x") }).unwrap();
+        let got = s.recent_failures(1).unwrap().remove(0).output.unwrap();
+        assert!(got.len() <= MAX_OUTPUT_BYTES && got.ends_with("END"));
+    }
+
+    #[test]
+    fn a_v4_database_gains_the_failures_table_and_keeps_its_data() {
+        let dir = temp_path("v4");
+        let path = dir.join("bb.db");
+        {
+            let mut s = Store::open(&path).unwrap();
+            s.insert(&sample(5)).unwrap();
+            s.conn.execute_batch("DROP TABLE failures; PRAGMA user_version = 4").unwrap();
+        }
+        let s = Store::open(&path).unwrap();
+        assert_eq!(s.window(5, 5).unwrap()[0], sample(5));
+        s.insert_failure(&failure(6, "x")).unwrap();
+        let v: i64 = s.conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+        assert_eq!(v, 5);
+        drop(s);
+        // Reopening is a no-op and keeps the failure.
+        assert_eq!(Store::open(&path).unwrap().recent_failures(5).unwrap().len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reopening_a_v5_database_keeps_its_failures() {
+        // An older release's migration is only the `version < 4` block, so it passes a
+        // v5 database through unchanged. That path is the one exercised here (reopening
+        // at 5); the older binary itself can't be run from this test.
+        let dir = temp_path("v5");
+        let path = dir.join("bb.db");
+        {
+            let s = Store::open(&path).unwrap();
+            s.insert_failure(&failure(9, "kept")).unwrap();
+        }
+        let s = Store::open(&path).unwrap();
+        assert_eq!(s.recent_failures(5).unwrap()[0].command, "kept");
+        drop(s);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn failures_are_pruned_relative_to_the_newest_failure_not_the_clock() {
+        let mut s = Store::open_in_memory().unwrap();
+        let last = 1_000_000_000;
+        s.insert_failure(&failure(last - 9 * 86400, "old")).unwrap();
+        s.insert_failure(&failure(last, "new")).unwrap();
+        // No samples at all, and the clock is far ahead: only the 9-day-older one goes.
+        s.maintain(last + 30 * 86400, 7).unwrap();
+        let left = s.recent_failures(10).unwrap();
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0].command, "new");
     }
 
     fn temp_path(tag: &str) -> PathBuf {
